@@ -299,10 +299,18 @@ impl Session {
         tracing::info!("mirror WS 101; SCREEN_START sent");
 
         let (tx, rx) = mpsc::channel::<Vec<u8>>(256);
-        let mut tasks =
-            vec![tokio::spawn(crate::screen::video_loop(video, tx, self.data_ip.clone()))];
+        // Privacy/lock events, fed by BOTH the mirror WS (`DEVICE_INFO:is_lock`) and,
+        // when it opens, /mirror/control (`NOTIFY_PASS`). One channel → the UI sees a
+        // single privacy/lock stream regardless of which surface the phone reports on.
+        let (evt_tx, events) = mpsc::channel::<String>(16);
+        let mut tasks = vec![tokio::spawn(crate::screen::video_loop(
+            video,
+            tx,
+            evt_tx.clone(),
+            self.data_ip.clone(),
+        ))];
 
-        let (input, events, cursor) = match open_ws(
+        let (input, cursor) = match open_ws(
             &self.data_ip,
             10381,
             "/mirror/control",
@@ -314,13 +322,13 @@ impl Session {
         {
             Ok(ws) => {
                 tracing::info!("control-input WS 101 (/mirror/control)");
-                let ic = crate::screen::setup_input(ws);
+                let ic = crate::screen::setup_input(ws, evt_tx.clone());
                 tasks.extend(ic.tasks);
-                (Some(ic.handle), ic.events, ic.cursor)
+                (Some(ic.handle), ic.cursor)
             }
             Err(e) => {
                 tracing::warn!(err = %e, "control-input channel unavailable (view-only)");
-                (None, crate::screen::closed_events(), crate::screen::closed_events())
+                (None, crate::screen::closed_events())
             }
         };
 

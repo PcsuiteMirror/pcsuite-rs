@@ -110,24 +110,24 @@ impl InputHandle {
 pub(crate) struct InputChannels {
     pub handle: InputHandle,
     pub tasks: Vec<JoinHandle<()>>,
-    /// Privacy/secure-screen state tokens (see [`screen::PrivacyState::token`]).
-    pub events: mpsc::Receiver<String>,
     /// IME state: `"x,y"` (caret, phone pixel space), `"on"` (field focused), or
     /// `"off"` (focus lost).
     pub cursor: mpsc::Receiver<String>,
 }
 
-pub(crate) fn setup_input(ws: WsClient<Tls>) -> InputChannels {
+/// `evt_tx` is the **shared** privacy/secure-screen event channel: the caller owns
+/// the receiver and also hands a clone to [`video_loop`], so a lock signalled on
+/// the mirror WS (`DEVICE_INFO:is_lock`) and a `NOTIFY_PASS` signalled here land in
+/// the same stream (see [`screen::PrivacyState::token`]).
+pub(crate) fn setup_input(ws: WsClient<Tls>, evt_tx: mpsc::Sender<String>) -> InputChannels {
     let (rd, wr) = ws.split();
     let (cmd_tx, cmd_rx) = mpsc::channel::<WsCmd>(64);
-    let (evt_tx, evt_rx) = mpsc::channel::<String>(16);
     let (cur_tx, cur_rx) = mpsc::channel::<String>(32);
     let reader = tokio::spawn(input_read_loop(rd, evt_tx, cur_tx, cmd_tx.clone()));
     let writer = tokio::spawn(input_write_loop(wr, cmd_rx));
     InputChannels {
         handle: InputHandle { tx: cmd_tx },
         tasks: vec![reader, writer],
-        events: evt_rx,
         cursor: cur_rx,
     }
 }
@@ -193,23 +193,28 @@ impl Screen {
         video.send_text(&screen::screen_start(&params)).await?;
         tracing::info!("mirror WS 101; SCREEN_START sent");
 
+        // Privacy/lock events, fed by BOTH the mirror WS (`DEVICE_INFO:is_lock`) and,
+        // when it opens, /mirror/control (`NOTIFY_PASS`). One channel → the UI sees a
+        // single privacy/lock stream regardless of which surface the phone reports on.
+        let (evt_tx, events) = mpsc::channel::<String>(16);
+
         // ── control-input WS (10381 /mirror/control), best-effort ──
-        let (input, events, cursor, input_tasks) =
+        let (input, cursor, input_tasks) =
             match open_ws(data_ip, 10381, "/mirror/control", config::SUBPROTOCOL_BASE, token, 3).await {
                 Ok(ws) => {
                     tracing::info!("control-input WS 101 (/mirror/control)");
-                    let ic = setup_input(ws);
-                    (Some(ic.handle), ic.events, ic.cursor, ic.tasks)
+                    let ic = setup_input(ws, evt_tx.clone());
+                    (Some(ic.handle), ic.cursor, ic.tasks)
                 }
                 Err(e) => {
                     tracing::warn!(err = %e, "control-input channel unavailable (view-only)");
-                    (None, closed_events(), closed_events(), Vec::new())
+                    (None, closed_events(), Vec::new())
                 }
             };
 
         let (tx, rx) = mpsc::channel::<Vec<u8>>(256);
         let control = tokio::spawn(control_loop(control));
-        let video = tokio::spawn(video_loop(video, tx, data_ip.to_string()));
+        let video = tokio::spawn(video_loop(video, tx, evt_tx, data_ip.to_string()));
 
         Ok(Screen {
             frames: rx,
@@ -467,11 +472,35 @@ impl AudioProbe {
 ///
 /// `tag` labels the [`MirrorStats`] lines: we pass the data IP, which distinguishes
 /// a USB adb-forward loopback from a LAN phone IP in a combined capture.
-pub(crate) async fn video_loop(mut ws: WsClient<Tls>, tx: mpsc::Sender<Vec<u8>>, tag: String) {
+///
+/// `evt_tx` is the shared privacy/lock channel: the phone's `DEVICE_INFO:` reply on
+/// this WS carries `is_lock`, and when it's set we forward a `lockScreen` token (the
+/// only lock signal on Android 16+, where the phone holds the stream open but sends
+/// no frames until the user unlocks).
+pub(crate) async fn video_loop(
+    mut ws: WsClient<Tls>,
+    tx: mpsc::Sender<Vec<u8>>,
+    evt_tx: mpsc::Sender<String>,
+    tag: String,
+) {
     let mut stats = MirrorStats::new(tag);
     let mut audio = AudioProbe::default();
     loop {
         match ws.recv().await {
+            Ok(WsFrame::Text(t)) => {
+                // The phone replies `DEVICE_INFO:{…,"is_lock":bool}` right after
+                // SCREEN_START. `is_lock:true` = the keyguard is up, so no frames will
+                // arrive until the user unlocks. This is a DIFFERENT signal from the
+                // `NOTIFY_PASS` foreground-window privacy state (which the phone reports
+                // as "clear" even while the keyguard is locked) — so we send a distinct
+                // token (`SCREEN_LOCKED`) the PC tracks separately and clears only when
+                // real frames flow, instead of letting a stray `NOTIFY_PASS:clear`
+                // override it. Drop rather than block if unread.
+                if screen::parse_device_info_lock(&t) == Some(true) {
+                    tracing::info!(target: "mirror_lock", "DEVICE_INFO is_lock=true → screen locked");
+                    let _ = evt_tx.try_send(screen::SCREEN_LOCKED.to_string());
+                }
+            }
             Ok(WsFrame::Binary(b)) => {
                 if !screen::is_video_frame(&b) {
                     // Non-video binary — audio packets arrive here when no_audio=false.

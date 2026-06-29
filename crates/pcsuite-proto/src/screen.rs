@@ -149,6 +149,27 @@ pub fn parse_notify_pass(line: &str) -> Option<PrivacyState> {
     })
 }
 
+/// Out-of-band privacy-channel token for "the device keyguard is locked" (derived
+/// from `DEVICE_INFO:is_lock`, not `NOTIFY_PASS`). Kept distinct from the
+/// [`PrivacyState`] tokens so the PC can track the keyguard lock independently of the
+/// foreground-window privacy state — the phone reports `NOTIFY_PASS:clear` even while
+/// locked, which must not clear the "please unlock" prompt.
+pub const SCREEN_LOCKED: &str = "screenLocked";
+
+/// Parse the phone's `DEVICE_INFO:{…}` reply for its lock flag (`is_lock`).
+///
+/// The phone sends `DEVICE_INFO` on the **mirror WS** right after `SCREEN_START`.
+/// `is_lock:true` means the device is on its lock screen — and on Android 16+ the
+/// phone then *blocks* the stream (sends no frames) until the user unlocks, after
+/// which it resumes on its own. Surfacing this lets the PC prompt "unlock your
+/// phone" instead of sitting on a frozen black picture. Returns `None` for any
+/// other message.
+pub fn parse_device_info_lock(line: &str) -> Option<bool> {
+    let body = line.strip_prefix("DEVICE_INFO:")?;
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    Some(v.get("is_lock").and_then(|x| x.as_bool()).unwrap_or(false))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,5 +216,20 @@ mod tests {
             parse_notify_pass(r#"NOTIFY_PASS:{"isPass":true,"privacyState":"lockScreen"}"#),
             Some(PrivacyState::LockScreen)
         );
+    }
+
+    #[test]
+    fn device_info_lock_parse() {
+        assert_eq!(parse_device_info_lock("SCREEN_START:{}"), None);
+        assert_eq!(
+            parse_device_info_lock(r#"DEVICE_INFO:{"sessionId":1,"is_lock":true}"#),
+            Some(true)
+        );
+        assert_eq!(
+            parse_device_info_lock(r#"DEVICE_INFO:{"sessionId":1,"is_lock":false}"#),
+            Some(false)
+        );
+        // Missing field → not locked (older phones omit it).
+        assert_eq!(parse_device_info_lock(r#"DEVICE_INFO:{"sessionId":1}"#), Some(false));
     }
 }
