@@ -10,13 +10,21 @@ pub struct MacClipboard;
 
 impl ClipboardBackend for MacClipboard {
     fn get_text(&self) -> Option<String> {
-        let out = std::process::Command::new("pbpaste").output().ok()?;
+        // pbpaste/pbcopy pick their encoding from LANG/LC_CTYPE and fall back to
+        // Mac OS Roman when neither is set. A GUI app launched via LaunchServices
+        // inherits no locale, so without this pin Chinese/UTF-8 text is mangled
+        // (UTF-8 bytes decoded as Mac Roman). Force UTF-8 on both directions.
+        let out = std::process::Command::new("pbpaste")
+            .env("LC_CTYPE", "UTF-8")
+            .output()
+            .ok()?;
         Some(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
     fn set_text(&self, text: &str) -> Result<()> {
         use std::io::Write;
         let mut child = std::process::Command::new("pbcopy")
+            .env("LC_CTYPE", "UTF-8")
             .stdin(std::process::Stdio::piped())
             .spawn()?;
         if let Some(stdin) = child.stdin.as_mut() {
