@@ -64,6 +64,10 @@ extension PcScreenRef {
         RustString(ptr: __swift_bridge__$PcScreen$next_privacy_event(ptr))
     }
 
+    public func next_audio_frame() -> RustVec<UInt8> {
+        RustVec(ptr: __swift_bridge__$PcScreen$next_audio_frame(ptr))
+    }
+
     public func next_input_cursor() -> RustString {
         RustString(ptr: __swift_bridge__$PcScreen$next_input_cursor(ptr))
     }
@@ -214,6 +218,10 @@ extension PcSessionRef {
 
     public func key(_ keycode: Int64) -> Bool {
         __swift_bridge__$PcSession$key(ptr, keycode)
+    }
+
+    public func set_audio_to_pc(_ to_pc: Bool) -> Bool {
+        __swift_bridge__$PcSession$set_audio_to_pc(ptr, to_pc)
     }
 }
 extension PcSession: Vectorizable {

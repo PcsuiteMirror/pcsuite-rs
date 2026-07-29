@@ -70,6 +70,15 @@ impl InputHandle {
         self.send(input::scroll_event(vscroll, x, y, w, h)).await
     }
 
+    /// Move the phone's audio between the phone's speaker and this PC, live.
+    ///
+    /// `to_pc = true`: the phone mutes itself and starts streaming AAC on the
+    /// mirror WS. `false`: it stops streaming and its own speaker comes back.
+    /// No stream restart — `SCREEN_START.no_audio` only sets the initial state.
+    pub async fn set_audio_to_pc(&self, to_pc: bool) -> Result<()> {
+        self.send(input::pc_mirror_config_no_audio(!to_pc)).await
+    }
+
     /// A convenience tap: down then up at the same point.
     pub async fn tap(&self, x: i64, y: i64, w: i64, h: i64) -> Result<()> {
         self.mouse(MouseAction::Down, MouseButton::Left, x, y, w, h).await?;
@@ -139,10 +148,18 @@ pub(crate) fn closed_events() -> mpsc::Receiver<String> {
     rx
 }
 
+/// A byte-frame receiver that is already closed — what [`crate::ScreenStream::take_audio`]
+/// leaves behind, so a second take (or a poll after one) ends immediately.
+pub(crate) fn closed_frames() -> mpsc::Receiver<Vec<u8>> {
+    let (_tx, rx) = mpsc::channel::<Vec<u8>>(1);
+    rx
+}
+
 /// An open screen-mirror session. Frames arrive via [`Screen::next_frame`].
 /// Dropping the `Screen` tears down all background tasks.
 pub struct Screen {
     frames: mpsc::Receiver<Vec<u8>>,
+    audio: mpsc::Receiver<Vec<u8>>,
     input: Option<InputHandle>,
     events: mpsc::Receiver<String>,
     cursor: mpsc::Receiver<String>,
@@ -213,11 +230,14 @@ impl Screen {
             };
 
         let (tx, rx) = mpsc::channel::<Vec<u8>>(256);
+        let (audio_tx, audio) = mpsc::channel::<Vec<u8>>(64);
         let control = tokio::spawn(control_loop(control));
-        let video = tokio::spawn(video_loop(video, tx, evt_tx, data_ip.to_string()));
+        let with_time = params.frame_with_time;
+        let video = tokio::spawn(video_loop(video, tx, audio_tx, evt_tx, data_ip.to_string(), with_time));
 
         Ok(Screen {
             frames: rx,
+            audio,
             input,
             events,
             cursor,
@@ -246,6 +266,12 @@ impl Screen {
     /// Await the next IME caret report (`"x,y"` / `"off"`), or `None` at end.
     pub async fn next_input_cursor(&mut self) -> Option<String> {
         self.cursor.recv().await
+    }
+
+    /// Await the next **ADTS-framed AAC** packet (only when `no_audio:false`),
+    /// or `None` once the stream ends.
+    pub async fn next_audio(&mut self) -> Option<Vec<u8>> {
+        self.audio.recv().await
     }
 }
 
@@ -436,16 +462,15 @@ fn r2(x: f64) -> f64 {
     (x * 100.0).round() / 100.0
 }
 
-/// Inspects non-video binaries on the mirror WS (the audio packets the phone
-/// interleaves when `no_audio:false`). Audio isn't decoded yet — this logs the wire
-/// shape (size + a head sample) so the codec/framing can be reverse-engineered,
+/// Inspects binaries on the mirror WS that are neither video nor AAC audio. Logs
+/// the wire shape (size + a head sample) so anything new can be identified,
 /// while [`video_loop`] keeps these bytes out of the HEVC decoder.
 #[derive(Default)]
-struct AudioProbe {
+struct UnknownProbe {
     packets: u64,
 }
 
-impl AudioProbe {
+impl UnknownProbe {
     fn observe(&mut self, b: &[u8]) {
         self.packets += 1;
         // First packet (identify codec/framing) then a light heartbeat — don't spam.
@@ -458,11 +483,11 @@ impl AudioProbe {
                 .join(" ");
             tracing::info!(
                 target: "mirror_stats",
-                kind = "audio_probe",
+                kind = "unknown_probe",
                 packets = self.packets,
                 len = b.len(),
                 head = %head,
-                "non-video binary on mirror WS (audio? — not decoded)"
+                "binary on mirror WS that is neither video nor AAC"
             );
         }
     }
@@ -480,14 +505,27 @@ impl AudioProbe {
 pub(crate) async fn video_loop(
     mut ws: WsClient<Tls>,
     tx: mpsc::Sender<Vec<u8>>,
+    audio_tx: mpsc::Sender<Vec<u8>>,
     evt_tx: mpsc::Sender<String>,
     tag: String,
+    with_time: bool,
 ) {
     let mut stats = MirrorStats::new(tag);
-    let mut audio = AudioProbe::default();
+    let mut unknown = UnknownProbe::default();
+    let mut audio_packets: u64 = 0;
+    let mut texts_logged = 0u32;
     loop {
         match ws.recv().await {
             Ok(WsFrame::Text(t)) => {
+                // `DEVICE_INFO` also carries `with_audio` — the phone's own verdict on
+                // whether it will send audio at all, which gates its SCREEN_START audio
+                // path. Log the first few replies verbatim: when there's no sound, this
+                // separates "the phone refused" from "we never asked properly".
+                if texts_logged < 6 {
+                    texts_logged += 1;
+                    tracing::info!(target: "mirror_stats", kind = "phone_mirror_text",
+                                   "{}", t.chars().take(400).collect::<String>());
+                }
                 // The phone replies `DEVICE_INFO:{…,"is_lock":bool}` right after
                 // SCREEN_START. `is_lock:true` = the keyguard is up, so no frames will
                 // arrive until the user unlocks. This is a DIFFERENT signal from the
@@ -502,14 +540,36 @@ pub(crate) async fn video_loop(
                 }
             }
             Ok(WsFrame::Binary(b)) => {
-                if !screen::is_video_frame(&b) {
-                    // Non-video binary — audio packets arrive here when no_audio=false.
-                    // We don't decode audio yet; record the shape for RE and, crucially,
-                    // keep it out of the HEVC decoder (feeding it would corrupt video).
-                    audio.observe(&b);
+                // Audio and video share this WS when `no_audio:false`. Classify on the
+                // payload with any `FRAME:` tag stripped, because with `frame_with_time`
+                // the phone tags audio packets too — testing the raw bytes would send
+                // them down the video path and corrupt the picture.
+                let body = screen::strip_frame_header(&b, with_time);
+                if screen::is_audio_frame(body) {
+                    audio_packets += 1;
+                    if audio_packets == 1 {
+                        tracing::info!(
+                            target: "mirror_stats",
+                            kind = "audio_start",
+                            rate = screen::adts_sample_rate(body).unwrap_or(0),
+                            channels = screen::adts_channels(body).unwrap_or(0),
+                            len = body.len(),
+                            "AAC audio on mirror WS"
+                        );
+                    }
+                    // Never block the reader on audio: video shares this loop, and the
+                    // consumer may not be draining (playback off/failed). Dropping a
+                    // packet costs a click; stalling here would freeze the picture.
+                    let _ = audio_tx.try_send(body.to_vec());
                     continue;
                 }
-                let frame = screen::strip_frame_prefix(&b).to_vec();
+                if !screen::is_video_frame(&b) {
+                    // Neither video nor AAC. Record the shape and, crucially, keep it
+                    // out of the HEVC decoder (feeding it would corrupt video).
+                    unknown.observe(&b);
+                    continue;
+                }
+                let frame = body.to_vec();
                 stats.record_frame(frame.len());
                 if tx.send(frame).await.is_err() {
                     break; // receiver dropped
@@ -539,9 +599,19 @@ async fn input_read_loop(
     cur_tx: mpsc::Sender<String>,
     cmd_tx: mpsc::Sender<WsCmd>,
 ) {
+    let mut unhandled = 0u32;
     loop {
         match rd.recv().await {
             Ok(WsFrame::Text(t)) => {
+                // Anything we don't consume is still evidence about the phone's
+                // state — `VOLUME_INFO:` in particular is sent exactly when it
+                // starts audio capture, so it says whether a `no_audio` request
+                // actually took. Log the first handful, then stay quiet.
+                if !t.starts_with("MOUSE_EVENT") && unhandled < 12 {
+                    unhandled += 1;
+                    tracing::info!(target: "mirror_stats", kind = "phone_control_text",
+                                   "{}", t.chars().take(300).collect::<String>());
+                }
                 if let Some(state) = screen::parse_notify_pass(&t) {
                     // Privacy events are rare; drop rather than block if unread.
                     let _ = evt_tx.try_send(state.token().to_string());

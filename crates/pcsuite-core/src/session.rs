@@ -299,6 +299,10 @@ impl Session {
         tracing::info!("mirror WS 101; SCREEN_START sent");
 
         let (tx, rx) = mpsc::channel::<Vec<u8>>(256);
+        // AAC packets, when `no_audio:false`. Small: one packet is 1024 samples
+        // (~23ms) of ~96kbps audio, so 64 is well over a second of slack — and the
+        // sender drops rather than blocks, so a stalled consumer can't hold up video.
+        let (audio_tx, audio) = mpsc::channel::<Vec<u8>>(64);
         // Privacy/lock events, fed by BOTH the mirror WS (`DEVICE_INFO:is_lock`) and,
         // when it opens, /mirror/control (`NOTIFY_PASS`). One channel → the UI sees a
         // single privacy/lock stream regardless of which surface the phone reports on.
@@ -306,8 +310,10 @@ impl Session {
         let mut tasks = vec![tokio::spawn(crate::screen::video_loop(
             video,
             tx,
+            audio_tx,
             evt_tx.clone(),
             self.data_ip.clone(),
+            params.frame_with_time,
         ))];
 
         let (input, cursor) = match open_ws(
@@ -334,6 +340,7 @@ impl Session {
 
         Ok(ScreenStream {
             frames: rx,
+            audio,
             input,
             events,
             cursor,
@@ -345,6 +352,7 @@ impl Session {
 /// Raw HEVC frame stream + input handle from [`Session::enable_screen`].
 pub struct ScreenStream {
     frames: mpsc::Receiver<Vec<u8>>,
+    audio: mpsc::Receiver<Vec<u8>>,
     input: Option<InputHandle>,
     events: mpsc::Receiver<String>,
     cursor: mpsc::Receiver<String>,
@@ -382,6 +390,13 @@ impl ScreenStream {
     /// Take ownership of the IME-caret receiver (leaving a closed one).
     pub fn take_cursor(&mut self) -> mpsc::Receiver<String> {
         std::mem::replace(&mut self.cursor, crate::screen::closed_events())
+    }
+    /// Take ownership of the audio receiver (leaving a closed one), so playback
+    /// can be pumped on its own thread. Each item is one **ADTS-framed AAC**
+    /// packet exactly as the phone sent it (7-byte header + access unit); the
+    /// header carries the sample rate and channel count.
+    pub fn take_audio(&mut self) -> mpsc::Receiver<Vec<u8>> {
+        std::mem::replace(&mut self.audio, crate::screen::closed_frames())
     }
 }
 

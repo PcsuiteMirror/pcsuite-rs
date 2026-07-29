@@ -13,6 +13,14 @@ use serde::Serialize;
 pub struct ScreenParams {
     pub device_type: i64,
     pub first_file_open: bool,
+    /// Ask the phone to prefix every media packet with a send timestamp.
+    ///
+    /// ⚠️ The phone switches on the **presence of the key**, not its value
+    /// (`ScreenController`: `if (json.has("frame_with_time")) setFrameWithTime(true)`),
+    /// so serializing `false` turns it **on**. Omitted when false for exactly that
+    /// reason — sending it cost us the audio: with timestamps on, audio packets also
+    /// carry the `FRAME:` tag and were demuxed as video.
+    #[serde(skip_serializing_if = "is_false")]
     pub frame_with_time: bool,
     pub image_quality: i64,
     pub max_size: i64,
@@ -38,6 +46,10 @@ pub struct ScreenParams {
 
 fn is_zero(v: &i64) -> bool {
     *v == 0
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 impl Default for ScreenParams {
@@ -83,10 +95,28 @@ pub const KEEPALIVE: &str = "normal";
 /// raw HEVC payload; strip it if present.
 pub const FRAME_PREFIX: &[u8; 6] = b"FRAME:";
 
+/// With `frame_with_time`, the `FRAME:` tag is followed by an 8-byte
+/// `System.currentTimeMillis()` and a 2-byte encode-duration short before the
+/// payload (`PcTransportManager.sendVideo/sendAudio`) — on **audio packets too**.
+pub const FRAME_TIME_HEADER_LEN: usize = 10;
+
 /// Strip a leading `FRAME:` tag from a binary mirror frame, if present.
 pub fn strip_frame_prefix(payload: &[u8]) -> &[u8] {
+    strip_frame_header(payload, false)
+}
+
+/// Strip the phone's framing to get at the media payload.
+///
+/// `with_time` must match the `frame_with_time` we asked for in `SCREEN_START`:
+/// the timestamp header can't be sniffed, because a millisecond timestamp begins
+/// `00 00 01 …` and is indistinguishable from a 3-byte Annex-B start code.
+pub fn strip_frame_header(payload: &[u8], with_time: bool) -> &[u8] {
     if payload.len() >= FRAME_PREFIX.len() && &payload[..FRAME_PREFIX.len()] == FRAME_PREFIX {
-        &payload[FRAME_PREFIX.len()..]
+        let mut off = FRAME_PREFIX.len();
+        if with_time && payload.len() >= off + FRAME_TIME_HEADER_LEN {
+            off += FRAME_TIME_HEADER_LEN;
+        }
+        &payload[off..]
     } else {
         payload
     }
@@ -102,6 +132,41 @@ pub fn is_video_frame(payload: &[u8]) -> bool {
         return true;
     }
     payload.starts_with(&[0, 0, 0, 1]) || payload.starts_with(&[0, 0, 1])
+}
+
+/// Bytes of the ADTS header the phone puts on every AAC access unit.
+pub const ADTS_HEADER_LEN: usize = 7;
+
+/// Is this binary mirror message an AAC audio packet?
+///
+/// The phone's `AACEncoder.addADTStoPacket` prepends a 7-byte **ADTS** header to
+/// every access unit (`ff f9 50 …` = MPEG-2 AAC-LC, no CRC), and
+/// `ChannelHandler.writeAudio` puts it on the *same* WS as video with no extra
+/// framing — so the syncword is the only thing telling audio and video apart.
+/// Test it on the payload with any `FRAME:` prefix already stripped: with
+/// `frame_with_time` the phone tags audio packets too.
+pub fn is_audio_frame(payload: &[u8]) -> bool {
+    // syncword 0xFFF + layer == 00 (mask keeps the sync low nibble and the layer
+    // bits; the ID and protection_absent bits are free to vary).
+    payload.len() > ADTS_HEADER_LEN && payload[0] == 0xFF && (payload[1] & 0xF6) == 0xF0
+}
+
+/// Sample rate carried in an ADTS header, or `None` if the index is reserved.
+/// The phone encodes at 44100 Hz, but it honours a request override, so read it
+/// from the stream rather than assuming.
+pub fn adts_sample_rate(header: &[u8]) -> Option<u32> {
+    const RATES: [u32; 13] = [
+        96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350,
+    ];
+    RATES
+        .get(((header.get(2)? >> 2) & 0x0F) as usize)
+        .copied()
+}
+
+/// Channel configuration carried in an ADTS header (0 = "in the AAC payload").
+pub fn adts_channels(header: &[u8]) -> Option<u8> {
+    let hi = (header.get(2)? & 0x01) << 2;
+    Some(hi | (header.get(3)? >> 6))
 }
 
 /// Privacy / secure-screen state the phone reports via `NOTIFY_PASS:`. When the
@@ -183,6 +248,25 @@ mod tests {
         assert_eq!(json["max_size"], 2336);
         assert_eq!(json["screenPrivacy"], false);
         assert_eq!(json["no_audio"], true);
+        // Must be ABSENT, not false: the phone enables timestamped framing on the
+        // key's presence alone, which also re-frames audio and breaks the demux.
+        assert!(json.get("frame_with_time").is_none());
+        let on = screen_start(&ScreenParams { frame_with_time: true, ..ScreenParams::default() });
+        assert!(on.contains("\"frame_with_time\":true"));
+    }
+
+    #[test]
+    fn frame_header_strip_with_timestamps() {
+        // FRAME: + 8B millis + 2B short + payload
+        let mut pkt = b"FRAME:".to_vec();
+        pkt.extend_from_slice(&1_753_000_000_000u64.to_be_bytes());
+        pkt.extend_from_slice(&7u16.to_be_bytes());
+        pkt.extend_from_slice(&[0xFF, 0xF9, 0x50, 0xA0, 0x01, 0xA0, 0x00, 0x21]);
+        let body = strip_frame_header(&pkt, true);
+        assert!(is_audio_frame(body), "timestamped audio must still read as audio");
+        // Without the flag the 10-byte header stays, and the packet is unrecognisable —
+        // the exact failure that sent audio into the video decoder.
+        assert!(!is_audio_frame(strip_frame_header(&pkt, false)));
     }
 
     #[test]
@@ -195,6 +279,40 @@ mod tests {
         assert_eq!(strip_frame_prefix(b"FRAME:abc"), b"abc");
         assert_eq!(strip_frame_prefix(b"abc"), b"abc");
         assert_eq!(strip_frame_prefix(b"FRAME:"), b"");
+    }
+
+    /// The exact header `AACEncoder.addADTStoPacket` builds for a 100-byte AU:
+    /// 0xFF 0xF9 = syncword + MPEG-2 + no CRC, 0x50 = AAC-LC / 44100 Hz,
+    /// then channel_configuration = 2 and the 13-bit frame length.
+    fn phone_adts(au_len: usize) -> Vec<u8> {
+        let n = au_len + ADTS_HEADER_LEN;
+        let mut v = vec![
+            0xFF,
+            0xF9,
+            0x50,
+            ((n >> 11) as u8) + 128,
+            ((n & 0x7FF) >> 3) as u8,
+            (((n & 7) << 5) as u8) + 31,
+            0xFC,
+        ];
+        v.extend(std::iter::repeat(0xAB).take(au_len));
+        v
+    }
+
+    #[test]
+    fn audio_frames_are_recognised_and_described() {
+        let pkt = phone_adts(100);
+        assert!(is_audio_frame(&pkt));
+        assert!(!is_video_frame(&pkt));
+        assert_eq!(adts_sample_rate(&pkt), Some(44100));
+        assert_eq!(adts_channels(&pkt), Some(2));
+    }
+
+    #[test]
+    fn video_is_not_mistaken_for_audio() {
+        assert!(!is_audio_frame(&[0, 0, 0, 1, 0x26, 0x01, 0xAF, 0x00]));
+        assert!(!is_audio_frame(b"FRAME:\x00\x00\x00\x01xx"));
+        assert!(!is_audio_frame(&[0xFF, 0xF9])); // header only, no payload
     }
 
     #[test]

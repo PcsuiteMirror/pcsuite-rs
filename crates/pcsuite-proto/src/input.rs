@@ -99,6 +99,21 @@ pub fn text_delete_surrounding(before: i64, after: i64) -> String {
     )
 }
 
+/// Build the `PC_MIRROR_CONFIG:{…}` that moves the phone's audio between the
+/// phone's own speaker and this PC — **live, without restarting the stream**
+/// (`SCREEN_START.no_audio` only sets the state the stream opens with).
+///
+/// The phone's `ControlEventController` routes this to
+/// `AudioThread.start/stopRecord()`: `no_audio:false` makes it mute its own
+/// speaker (`phone_mute=true`) and stream AAC to us; `true` stops the capture and
+/// un-mutes it. Send it on `/mirror/control`.
+pub fn pc_mirror_config_no_audio(no_audio: bool) -> String {
+    format!(
+        "PC_MIRROR_CONFIG:{}",
+        json!({ "update_place": "no_audio", "no_audio": no_audio })
+    )
+}
+
 /// Build a `KEYCODE_EVENT:{…}` text message — injects an Android `KeyEvent`.
 /// `keycode` is an Android `KEYCODE_*` value (e.g. BACK=4, HOME=3, APP_SWITCH=187);
 /// `metastate`/`scancode` are 0 for an ordinary press.
@@ -216,6 +231,22 @@ mod tests {
         assert_eq!(
             parse_input_event(r#"PHONE_TO_PAD_INPUT_READY:{"isInput":true}"#),
             Some(InputEvent::Focus(true))
+        );
+    }
+
+    #[test]
+    fn audio_routing_message_shape() {
+        let m = pc_mirror_config_no_audio(false);
+        assert!(m.starts_with("PC_MIRROR_CONFIG:"));
+        let v: serde_json::Value = serde_json::from_str(&m["PC_MIRROR_CONFIG:".len()..]).unwrap();
+        assert_eq!(v["update_place"], "no_audio");   // the phone switches on this key
+        assert_eq!(v["no_audio"], false);            // false = stream it to the PC
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                &pc_mirror_config_no_audio(true)["PC_MIRROR_CONFIG:".len()..]
+            )
+            .unwrap()["no_audio"],
+            true
         );
     }
 

@@ -54,6 +54,12 @@ mod ffi {
         // stop() is called. Loop this on a background thread: when the phone hits
         // a secure surface it stops the video, so show a "handle on phone" hint.
         fn next_privacy_event(&self) -> String;
+        // Block for the next audio packet: one ADTS-framed AAC access unit exactly
+        // as the phone sent it (7-byte ADTS header carrying sample rate + channel
+        // count, then the AU). Only flows when start_screen was called with
+        // audio=true. Empty Vec = stream ended OR stop() was called. Loop this on a
+        // background thread and feed a decoder.
+        fn next_audio_frame(&self) -> Vec<u8>;
         // Block for the next IME caret report from the phone, as "x,y" (caret
         // position in the mirror's pixel space) or "off" (focused field went
         // away). Returns "" when the stream ends / stop() is called. Use it to
@@ -147,6 +153,11 @@ mod ffi {
         // Press an Android key (down+up). keycode is a KEYCODE_* value, e.g.
         // BACK=4, HOME=3, APP_SWITCH=187. Drives the on-screen navigation keys.
         fn key(&self, keycode: i64) -> bool;
+        // Move the phone's audio between the phone's own speaker and this PC while
+        // mirroring — no stream restart. to_pc=true: the phone mutes itself and
+        // starts sending AAC (poll next_audio_frame); false: it stops sending and
+        // its speaker comes back. Needs start_screen() first (rides /mirror/control).
+        fn set_audio_to_pc(&self, to_pc: bool) -> bool;
     }
 
     extern "Rust" {
@@ -318,6 +329,8 @@ pub struct PcScreen {
     events: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<String>>,
     // IME caret reports, polled on its own thread for the same reason.
     cursor: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<String>>,
+    // ADTS-framed AAC packets, polled on its own thread for the same reason.
+    audio: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Vec<u8>>>,
     // Set by stop(); the next_*() pollers observe it between short recv timeouts
     // and return empty so the polling threads break and drop this.
     stop: std::sync::atomic::AtomicBool,
@@ -360,6 +373,23 @@ impl PcScreen {
                     Ok(Some(tok)) => return tok,    // a privacy state token
                     Ok(None) => return String::new(), // channel closed (stream ended)
                     Err(_) => continue,             // timeout -> re-check stop
+                }
+            }
+        })
+    }
+
+    fn next_audio_frame(&self) -> Vec<u8> {
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+        rt().block_on(async {
+            let mut audio = self.audio.lock().await;
+            loop {
+                if self.stop.load(Ordering::Relaxed) {
+                    return Vec::new();
+                }
+                match tokio::time::timeout(Duration::from_millis(300), audio.recv()).await {
+                    Ok(opt) => return opt.unwrap_or_default(),
+                    Err(_) => continue, // silence (or audio off) -> re-check stop
                 }
             }
         })
@@ -412,10 +442,12 @@ impl PcSession {
         *self.input.lock().unwrap() = stream.input();
         let events = stream.take_events();
         let cursor = stream.take_cursor();
+        let audio_rx = stream.take_audio();
         Ok(PcScreen {
             frames: tokio::sync::Mutex::new(stream),
             events: tokio::sync::Mutex::new(events),
             cursor: tokio::sync::Mutex::new(cursor),
+            audio: tokio::sync::Mutex::new(audio_rx),
             stop: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -709,6 +741,13 @@ impl PcSession {
             return false;
         };
         rt().block_on(input.key(keycode)).is_ok()
+    }
+
+    fn set_audio_to_pc(&self, to_pc: bool) -> bool {
+        let Some(input) = self.input.lock().unwrap().clone() else {
+            return false;
+        };
+        rt().block_on(input.set_audio_to_pc(to_pc)).is_ok()
     }
 }
 
