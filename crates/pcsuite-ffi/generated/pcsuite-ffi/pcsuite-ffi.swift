@@ -19,6 +19,9 @@ public func pcsuite_connect_usb() throws -> PcSession {
 public func pcsuite_connect_lan<GenericIntoRustString: IntoRustString>(_ phone_ip: GenericIntoRustString, _ remote: Bool) throws -> PcSession {
     try { let val = __swift_bridge__$pcsuite_connect_lan({ let rustString = phone_ip.intoRustString(); rustString.isOwned = false; return rustString.ptr }(), remote); if val.is_ok { return PcSession(ptr: val.ok_or_err!) } else { throw RustString(ptr: val.ok_or_err!) } }()
 }
+public func pcsuite_cancel_connect() {
+    __swift_bridge__$pcsuite_cancel_connect()
+}
 public func pcsuite_pair_begin<GenericIntoRustString: IntoRustString>(_ lip: GenericIntoRustString) -> PcPairing {
     PcPairing(ptr: __swift_bridge__$pcsuite_pair_begin({ let rustString = lip.intoRustString(); rustString.isOwned = false; return rustString.ptr }()))
 }

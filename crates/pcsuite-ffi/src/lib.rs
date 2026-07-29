@@ -168,6 +168,12 @@ mod ffi {
         fn pcsuite_connect_usb() -> Result<PcSession, String>;
         // Connect over LAN/Tailscale. remote=true uses connectType=1 (no seed).
         fn pcsuite_connect_lan(phone_ip: String, remote: bool) -> Result<PcSession, String>;
+        // Abort an in-flight pcsuite_connect_usb / pcsuite_connect_lan / PcPaired
+        // connect() from another thread: it gives up its sockets and returns the
+        // error "connect cancelled" right away instead of waiting out the network
+        // timeouts (a remembered Wi-Fi IP that no longer answers takes ~30s).
+        // Safe to call when nothing is connecting.
+        fn pcsuite_cancel_connect();
         // Begin QR pairing (local ls=true variant — pure LAN, no cloud/seed/10191).
         // `lip` = this machine's LAN IP to advertise in the QR; pass "" to auto-detect.
         // Render qr_url() as a QR for the phone to scan via PCSuite 扫码连接电脑.
@@ -219,6 +225,43 @@ fn rt() -> &'static Runtime {
             .build()
             .expect("build tokio runtime")
     })
+}
+
+// ─────────────────────── connect cancellation ───────────────────────
+
+/// Cancel signal for the blocking `pcsuite_connect_*` calls, bumped by
+/// [`pcsuite_cancel_connect`].
+///
+/// Connecting is one long `block_on`, so without this the calling thread is
+/// parked until the network gives up — up to ~30 s against a phone that no
+/// longer owns the remembered IP. The app's "Cancel" would then do nothing
+/// visible, and every queued call behind it (disconnect, a connect to another
+/// device) would wait too. Selecting on this signal drops the connect future
+/// instead, which aborts the in-flight sockets and returns at once.
+static CONNECT_CANCEL: OnceLock<tokio::sync::watch::Sender<u64>> = OnceLock::new();
+
+fn connect_cancel() -> &'static tokio::sync::watch::Sender<u64> {
+    CONNECT_CANCEL.get_or_init(|| tokio::sync::watch::channel(0u64).0)
+}
+
+/// Run a connect future on the shared runtime, aborting it as soon as
+/// [`pcsuite_cancel_connect`] is called. Only cancels sent *after* this call
+/// starts count, so a stale cancel can't kill the next connect.
+fn block_on_cancellable<T>(
+    fut: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> Result<T, String> {
+    let mut cancel = connect_cancel().subscribe();
+    cancel.borrow_and_update(); // ignore cancels that happened before now
+    rt().block_on(async move {
+        tokio::select! {
+            r = fut => r.map_err(|e| format!("{e:#}")),
+            _ = cancel.changed() => Err("connect cancelled".to_string()),
+        }
+    })
+}
+
+fn pcsuite_cancel_connect() {
+    connect_cancel().send_modify(|gen| *gen += 1);
 }
 
 /// Local interface IP that routes toward `peer` (UDP connect picks the route).
@@ -714,27 +757,25 @@ fn pcsuite_set_clip_id(clip_id: String) {
 
 fn pcsuite_connect_usb() -> Result<PcSession, String> {
     let id = config::default_identity();
-    let (u, session) = rt()
-        .block_on(async {
-            let u = usb::prepare(UsbConfig {
-                pc_name: Some(id.device_name.clone()),
-                ..UsbConfig::default()
-            })
-            .await?;
-            // Best-effort, bounded: announce our display name *before* the WS comes
-            // up (which freezes the phone's "已连接" notification text). USB has no
-            // earlier name channel that reaches that notification; failures are
-            // harmless (the post-connect device-info fetch still sets the in-app
-            // name). Time-boxed so it can never stall the connect.
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(3),
-                pcsuite_core::device::announce_pc_name("127.0.0.1", &u.token, &id.device_name),
-            )
-            .await;
-            let session = Session::connect("127.0.0.1", &u.token).await?;
-            Ok::<_, anyhow::Error>((u, session))
+    let (u, session) = block_on_cancellable(async {
+        let u = usb::prepare(UsbConfig {
+            pc_name: Some(id.device_name.clone()),
+            ..UsbConfig::default()
         })
-        .map_err(|e| format!("{e:#}"))?;
+        .await?;
+        // Best-effort, bounded: announce our display name *before* the WS comes
+        // up (which freezes the phone's "已连接" notification text). USB has no
+        // earlier name channel that reaches that notification; failures are
+        // harmless (the post-connect device-info fetch still sets the in-app
+        // name). Time-boxed so it can never stall the connect.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            pcsuite_core::device::announce_pc_name("127.0.0.1", &u.token, &id.device_name),
+        )
+        .await;
+        let session = Session::connect("127.0.0.1", &u.token).await?;
+        Ok::<_, anyhow::Error>((u, session))
+    })?;
     let dead_rx = session.dead_signal();
     Ok(PcSession {
         session: tokio::sync::Mutex::new(session),
@@ -767,23 +808,21 @@ fn pcsuite_connect_lan(phone_ip: String, remote: bool) -> Result<PcSession, Stri
     } else {
         config::default_stored_seed(&phone_ip)
     };
-    let (reg, token, session) = rt()
-        .block_on(async {
-            let reg = register(RegisterConfig {
-                reg_ip: phone_ip.clone(),
-                identity: config::default_identity(),
-                stored_seed,
-                remote,
-                token: None,
-                conn_id: None,
-                presence: true,
-            })
-            .await?;
-            let token = reg.token.clone();
-            let session = Session::connect(&phone_ip, &token).await?;
-            Ok::<_, anyhow::Error>((reg, token, session))
+    let (reg, token, session) = block_on_cancellable(async {
+        let reg = register(RegisterConfig {
+            reg_ip: phone_ip.clone(),
+            identity: config::default_identity(),
+            stored_seed,
+            remote,
+            token: None,
+            conn_id: None,
+            presence: true,
         })
-        .map_err(|e| format!("{e:#}"))?;
+        .await?;
+        let token = reg.token.clone();
+        let session = Session::connect(&phone_ip, &token).await?;
+        Ok::<_, anyhow::Error>((reg, token, session))
+    })?;
     Ok(build_wlan_session(session, token, phone_ip, Some(reg)))
 }
 
@@ -921,9 +960,53 @@ impl PcPaired {
     fn connect(&self) -> Result<PcSession, String> {
         let phone_ip = self.notify.phone_ip.clone();
         let token = self.token.clone();
-        let session = rt()
-            .block_on(Session::connect(&phone_ip, &token))
-            .map_err(|e| format!("{e:#}"))?;
+        let session = block_on_cancellable(Session::connect(&phone_ip, &token))?;
         Ok(build_wlan_session(session, token, phone_ip, None))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// The cancel signal is process-global (only one connect runs at a time in the
+    /// app), so these tests must not overlap.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A cancel unblocks the calling thread immediately, instead of leaving it
+    /// parked for the whole network timeout — the app's "Cancel" button.
+    #[test]
+    fn cancel_aborts_a_blocking_connect() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = started.clone();
+        let t = std::thread::spawn(move || {
+            let began = Instant::now();
+            let r: Result<(), String> = block_on_cancellable(async move {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_secs(60)).await; // stands in for a dead IP
+                Ok(())
+            });
+            (r, began.elapsed())
+        });
+        // Wait for the connect to actually be in flight, then cancel it.
+        while !started.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        pcsuite_cancel_connect();
+        let (r, elapsed) = t.join().expect("connect thread panicked");
+        assert_eq!(r.unwrap_err(), "connect cancelled");
+        assert!(elapsed < Duration::from_secs(5), "took {elapsed:?}");
+    }
+
+    /// A cancel that arrives before a connect starts must not kill it.
+    #[test]
+    fn stale_cancel_does_not_affect_the_next_connect() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        pcsuite_cancel_connect();
+        let r: Result<u8, String> = block_on_cancellable(async { Ok(7) });
+        assert_eq!(r.unwrap(), 7);
     }
 }

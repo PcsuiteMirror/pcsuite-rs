@@ -78,6 +78,7 @@ void __swift_bridge__$pcsuite_set_seed(void* phone_ip, void* seed);
 void __swift_bridge__$pcsuite_set_clip_id(void* clip_id);
 struct __private__ResultPtrAndPtr __swift_bridge__$pcsuite_connect_usb(void);
 struct __private__ResultPtrAndPtr __swift_bridge__$pcsuite_connect_lan(void* phone_ip, bool remote);
+void __swift_bridge__$pcsuite_cancel_connect(void);
 void* __swift_bridge__$pcsuite_pair_begin(void* lip);
 void* __swift_bridge__$PcPairing$qr_url(void* self);
 void* __swift_bridge__$PcPairing$lan_ip(void* self);

@@ -58,6 +58,28 @@ impl Drop for Registration {
     }
 }
 
+/// Owns the presence task until [`register`] hands it to a [`Registration`].
+/// Registration can fail (unreachable phone) or be cancelled mid-flight (the app
+/// dropping the connect future), and a bare `JoinHandle` only *detaches* on drop
+/// — the loop would keep unicasting presence to the phone forever, one leaked
+/// task per failed attempt. Aborting on drop bounds it to the attempt.
+struct PresenceGuard(Option<JoinHandle<std::io::Result<()>>>);
+
+impl PresenceGuard {
+    /// Hand the task over to the caller (it becomes the `Registration`'s job).
+    fn release(mut self) -> Option<JoinHandle<std::io::Result<()>>> {
+        self.0.take()
+    }
+}
+
+impl Drop for PresenceGuard {
+    fn drop(&mut self) {
+        if let Some(h) = self.0.take() {
+            h.abort();
+        }
+    }
+}
+
 fn random_token() -> String {
     let mut b = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut b);
@@ -114,11 +136,11 @@ pub async fn register(cfg: RegisterConfig) -> Result<Registration> {
         };
         let b64 = STANDARD.encode(serde_json::to_vec(&pres)?);
         let announce = ssdp::build_announce(&b64);
-        let handle = tokio::spawn(ssdp::presence_loop(
+        let handle = PresenceGuard(Some(tokio::spawn(ssdp::presence_loop(
             cfg.reg_ip.clone(),
             announce,
             Duration::from_secs(2),
-        ));
+        ))));
         // give the phone a moment to register us as an active nearby peer
         tokio::time::sleep(Duration::from_secs(2)).await;
         Some(handle)
@@ -129,7 +151,7 @@ pub async fn register(cfg: RegisterConfig) -> Result<Registration> {
     tracing::info!(reg_ip = %cfg.reg_ip, remote = cfg.remote, "ConnectFlow: connecting 10191");
     let mut sock = tcp::connect(&cfg.reg_ip, 10191)
         .await
-        .context("connect 10191 (phone idle / WiFi off?)")?;
+        .context("connect 10191 (phone idle / WiFi off / IP changed?)")?;
 
     // [1] device-info exchange
     let dframe = payload1::encode_json(&connect::device_info_frame(&cfg.identity, 22))?;
@@ -188,6 +210,6 @@ pub async fn register(cfg: RegisterConfig) -> Result<Registration> {
         phone_ip: cfg.reg_ip,
         token,
         conn_id,
-        presence_task,
+        presence_task: presence_task.and_then(PresenceGuard::release),
     })
 }
