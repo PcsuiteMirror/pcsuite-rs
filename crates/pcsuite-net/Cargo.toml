@@ -9,6 +9,7 @@ description = "Transport: SSDP discovery/presence, TLS (self-signed, no-verify),
 tokio.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
+webpki-roots.workspace = true
 socket2.workspace = true
 base64.workspace = true
 rand.workspace = true

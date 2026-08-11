@@ -1,5 +1,8 @@
 {
-  "_comment": "Copy to pcsuite.json (git-ignored) or $HOME/.config/pcsuite/config.json, then fill in your own pairing identity. Every field can also be set via env (PCSUITE_OPEN_ID, PCSUITE_PC_MAC, PCSUITE_ACCOUNT, PCSUITE_DEVICE_NAME, PCSUITE_SEED), which overrides the file.",
+  "_comment": "Copy to pcsuite.json (git-ignored) or $HOME/.config/pcsuite/config.json, then fill in your own pairing identity. Every field can also be set via env (PCSUITE_MODE, PCSUITE_OPEN_ID, PCSUITE_PC_MAC, PCSUITE_ACCOUNT, PCSUITE_DEVICE_NAME, PCSUITE_SEED), which overrides the file.",
+
+  "_comment_mode": "\"serverless\" (default) never contacts any server. \"vivo_account\" enables the connection-center registration in docs/VIVO_ACCOUNT_LOGIN.md; sign in with `pcsuite cloud login`, which stores the token in ~/.config/pcsuite/account.json (0600) — not here. Anything unrecognised means serverless.",
+  "mode": "serverless",
 
   "open_id": "your-account-openid",
   "pc_mac": "001122334455",

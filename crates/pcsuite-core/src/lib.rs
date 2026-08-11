@@ -11,6 +11,7 @@
 
 pub mod adb;
 pub mod clipboard;
+pub mod cloud;
 pub mod config;
 pub mod connect;
 pub mod device;
@@ -27,6 +28,7 @@ pub mod verify;
 pub mod wsconn;
 
 pub use clipboard::{run_clipboard, ClipboardBackend, ClipboardConfig};
+pub use cloud::{Account, CloudDevice, ConnectCenter};
 pub use connect::{register, RegisterConfig, Registration};
 pub use device::DeviceInfo;
 pub use filetrans::{FileTransConfig, FileTransEvent};

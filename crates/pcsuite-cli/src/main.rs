@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use pcsuite_core::{
-    config, device, mdfs, pair, register, run_clipboard, run_notify, run_verify, usb,
+    cloud, config, device, mdfs, pair, register, run_clipboard, run_notify, run_verify, usb,
     ClipboardBackend, ClipboardConfig, ListKind, NotifyConfig, RegisterConfig, Registration, Screen,
     ScreenParams, Session, UsbConfig, VerifyConfig,
 };
@@ -57,6 +57,11 @@ struct Args {
     to: Option<String>,
     /// `push` duplicate-name policy: overwrite instead of rename.
     overwrite: bool,
+    /// `cloud` subcommand: status|login|register|devices|logout.
+    sub: Option<String>,
+    /// `cloud login` credentials (from the app's QR login, or a captured session).
+    open_id: Option<String>,
+    token: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -83,6 +88,9 @@ fn parse_args() -> Args {
         files: Vec::new(),
         to: None,
         overwrite: false,
+        sub: None,
+        open_id: None,
+        token: None,
     };
     let mut i = 1;
     while i < raw.len() {
@@ -133,10 +141,22 @@ fn parse_args() -> Args {
                 a.to = raw.get(i).cloned();
             }
             "--overwrite" => a.overwrite = true,
+            "--open-id" => {
+                i += 1;
+                a.open_id = raw.get(i).cloned();
+            }
+            "--token" => {
+                i += 1;
+                a.token = raw.get(i).cloned();
+            }
             _ => {
-                // Positional args (push 的本地文件列表)；未知 --flag 照旧忽略。
+                // Positional args (push 的本地文件列表 / cloud 的子命令)；未知 --flag 照旧忽略。
                 if !flag.starts_with("--") {
-                    a.files.push(flag);
+                    if a.cmd == "cloud" && a.sub.is_none() {
+                        a.sub = Some(flag);
+                    } else {
+                        a.files.push(flag);
+                    }
                 }
             }
         }
@@ -163,6 +183,8 @@ fn print_help() {
          pcsuite share-recv [--out <本地目录>]   (互传/EasyShare 接收：独立 10191 监听，无需连接会话)\n  \
          pcsuite all (--usb | --phone <IP> [--remote]) [--screen|--clipboard|--verify|--notify] \
          [--seconds <N>] [--out <f>]\n  \
+         pcsuite cloud status|register|devices|logout   (vivo 账号模式：把本机注册到连接中心)\n  \
+         pcsuite cloud login --open-id <ID> --token <TOKEN>   (凭据来自 app 的扫码登录)\n\
          \x20                                       (clipboard+verify+notify in the background; type\n\
          \x20                                        `screen on`/`screen off` at the prompt to\n\
          \x20                                        toggle mirroring. --screen starts it on.)\n\n\
@@ -199,6 +221,7 @@ async fn main() -> Result<()> {
         "recv" => cmd_recv(args).await,
         "share-recv" => cmd_share_recv(args).await,
         "all" => cmd_all(args).await,
+        "cloud" => cmd_cloud(args).await,
         "" | "help" | "-h" | "--help" => {
             print_help();
             Ok(())
@@ -1036,6 +1059,93 @@ fn human_size(n: u64) -> String {
 }
 
 /// Unified session: screen + clipboard + verify-code over one control connection.
+/// `pcsuite cloud …` — the vivo-account mode: sign in with credentials the app's
+/// QR login produced, register this PC with the connection center, and list the
+/// account's devices (each phone's LAN address comes back with it, so it can be
+/// fed straight to `--phone`).
+///
+/// Serverless mode never runs any of this; the commands here are the only place
+/// the CLI talks to a vendor server.
+async fn cmd_cloud(args: Args) -> Result<()> {
+    let sub = args.sub.clone().unwrap_or_else(|| "status".into());
+    match sub.as_str() {
+        "login" => {
+            let (Some(open_id), Some(token)) = (args.open_id.clone(), args.token.clone()) else {
+                anyhow::bail!(
+                    "cloud login needs --open-id <ID> --token <TOKEN>\n\
+                     Both come from the QR login (app menu → 「vivo 账号…」→ 扫码登录);\n\
+                     the CLI cannot show the login page itself."
+                );
+            };
+            let acc = cloud::Account::new(open_id, token);
+            cloud::save_account(&acc)?;
+            println!("✅ 已保存账号凭据 → {}", show_account_path());
+            println!("   openId  {}", acc.open_id);
+            println!("   本机 deviceId {}", cloud::pc_device_id()?);
+            println!("   下一步: pcsuite cloud register");
+            Ok(())
+        }
+        "logout" => {
+            cloud::clear_account()?;
+            println!("✅ 已清除本机保存的账号凭据");
+            Ok(())
+        }
+        "status" => {
+            let device_id = cloud::pc_device_id()?;
+            println!("模式        {}", config::mode().as_str());
+            println!("deviceId    {device_id}");
+            println!("clipPcId    {}  (deviceId 前 6 位)", cloud::derived_clip_pc_id()?);
+            println!("本机 LAN IP {}", cloud::local_ipv4s().join(", "));
+            match cloud::load_account() {
+                Some(a) => println!("账号        已登录 openId={}", a.open_id),
+                None => println!("账号        未登录  (先跑 pcsuite cloud login)"),
+            }
+            Ok(())
+        }
+        "register" => {
+            let acc = require_account()?;
+            let device_id = cloud::register_this_pc(acc).await?;
+            println!("✅ 已把本机注册到连接中心, deviceId={device_id}");
+            println!("   手机端「连接中心」里现在应该能看到这台电脑。");
+            Ok(())
+        }
+        "devices" => {
+            let cc = cloud::ConnectCenter::new(require_account()?)?;
+            let list = cc.device_list().await?;
+            if list.is_empty() {
+                println!("(账号下没有设备)");
+                return Ok(());
+            }
+            for d in &list {
+                let kind = if d.is_phone() { "📱" } else { "💻" };
+                let ip = d.ip().unwrap_or("-");
+                println!("{kind} {:<22} {ip:<16} {:<10} 上报 {}", d.name, d.model, d.report_time);
+                // The phone publishes its own connectType=2 seeds here — the values
+                // that otherwise have to be copied out of an official pairing.
+                for (ip, seed) in &d.seeds {
+                    println!("   seed {ip} = {seed}");
+                }
+            }
+            println!("\n提示: 手机的 IP 可直接喂给 `pcsuite screen --phone <IP> --remote`");
+            println!("      上面列出的 seed 可写进 pcsuite.json 的 \"seeds\"(connectType=2)");
+            Ok(())
+        }
+        other => {
+            anyhow::bail!("unknown cloud subcommand: {other} (status|login|register|devices|logout)")
+        }
+    }
+}
+
+fn require_account() -> Result<cloud::Account> {
+    cloud::load_account().context("未登录：先跑 `pcsuite cloud login --open-id … --token …`")
+}
+
+fn show_account_path() -> String {
+    cloud::account_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "<no HOME>".into())
+}
+
 async fn cmd_all(args: Args) -> Result<()> {
     // Background features (clipboard + verify + notify) default on; screen does NOT
     // auto-start — toggle it at runtime from the prompt (or pass --screen to start on).

@@ -16,6 +16,9 @@ public func pcsuite_set_clip_id<GenericIntoRustString: IntoRustString>(_ clip_id
 public func pcsuite_connect_usb() throws -> PcSession {
     try { let val = __swift_bridge__$pcsuite_connect_usb(); if val.is_ok { return PcSession(ptr: val.ok_or_err!) } else { throw RustString(ptr: val.ok_or_err!) } }()
 }
+public func pcsuite_usb_probe() -> RustString {
+    RustString(ptr: __swift_bridge__$pcsuite_usb_probe())
+}
 public func pcsuite_connect_lan<GenericIntoRustString: IntoRustString>(_ phone_ip: GenericIntoRustString, _ remote: Bool) throws -> PcSession {
     try { let val = __swift_bridge__$pcsuite_connect_lan({ let rustString = phone_ip.intoRustString(); rustString.isOwned = false; return rustString.ptr }(), remote); if val.is_ok { return PcSession(ptr: val.ok_or_err!) } else { throw RustString(ptr: val.ok_or_err!) } }()
 }
@@ -24,6 +27,30 @@ public func pcsuite_cancel_connect() {
 }
 public func pcsuite_pair_begin<GenericIntoRustString: IntoRustString>(_ lip: GenericIntoRustString) -> PcPairing {
     PcPairing(ptr: __swift_bridge__$pcsuite_pair_begin({ let rustString = lip.intoRustString(); rustString.isOwned = false; return rustString.ptr }()))
+}
+public func pcsuite_set_mode<GenericIntoRustString: IntoRustString>(_ mode: GenericIntoRustString) {
+    __swift_bridge__$pcsuite_set_mode({ let rustString = mode.intoRustString(); rustString.isOwned = false; return rustString.ptr }())
+}
+public func pcsuite_mode() -> RustString {
+    RustString(ptr: __swift_bridge__$pcsuite_mode())
+}
+public func pcsuite_cloud_set_account<GenericIntoRustString: IntoRustString>(_ open_id: GenericIntoRustString, _ token: GenericIntoRustString, _ country_code: GenericIntoRustString) {
+    __swift_bridge__$pcsuite_cloud_set_account({ let rustString = open_id.intoRustString(); rustString.isOwned = false; return rustString.ptr }(), { let rustString = token.intoRustString(); rustString.isOwned = false; return rustString.ptr }(), { let rustString = country_code.intoRustString(); rustString.isOwned = false; return rustString.ptr }())
+}
+public func pcsuite_cloud_device_id() -> RustString {
+    RustString(ptr: __swift_bridge__$pcsuite_cloud_device_id())
+}
+public func pcsuite_cloud_clip_pc_id() -> RustString {
+    RustString(ptr: __swift_bridge__$pcsuite_cloud_clip_pc_id())
+}
+public func pcsuite_cloud_register() throws -> RustString {
+    try { let val = __swift_bridge__$pcsuite_cloud_register(); if val.is_ok { return RustString(ptr: val.ok_or_err!) } else { throw RustString(ptr: val.ok_or_err!) } }()
+}
+public func pcsuite_cloud_devices() throws -> RustString {
+    try { let val = __swift_bridge__$pcsuite_cloud_devices(); if val.is_ok { return RustString(ptr: val.ok_or_err!) } else { throw RustString(ptr: val.ok_or_err!) } }()
+}
+public func pcsuite_cloud_unregister() throws -> RustString {
+    try { let val = __swift_bridge__$pcsuite_cloud_unregister(); if val.is_ok { return RustString(ptr: val.ok_or_err!) } else { throw RustString(ptr: val.ok_or_err!) } }()
 }
 
 public class PcScreen: PcScreenRefMut {
@@ -182,6 +209,22 @@ extension PcSessionRef {
 
     public func stop_notify() {
         __swift_bridge__$PcSession$stop_notify(ptr)
+    }
+
+    public func push_files<GenericIntoRustString: IntoRustString>(_ paths: RustVec<GenericIntoRustString>, _ save_dir: GenericIntoRustString) throws -> RustString {
+        try { let val = __swift_bridge__$PcSession$push_files(ptr, { let val = paths; val.isOwned = false; return val.ptr }(), { let rustString = save_dir.intoRustString(); rustString.isOwned = false; return rustString.ptr }()); if val.is_ok { return RustString(ptr: val.ok_or_err!) } else { throw RustString(ptr: val.ok_or_err!) } }()
+    }
+
+    public func enable_file_transfer<GenericIntoRustString: IntoRustString>(_ save_dir: GenericIntoRustString) throws -> () {
+        try { let val = __swift_bridge__$PcSession$enable_file_transfer(ptr, { let rustString = save_dir.intoRustString(); rustString.isOwned = false; return rustString.ptr }()); if val != nil { throw RustString(ptr: val!) } else { return } }()
+    }
+
+    public func next_file_transfer_event() -> RustString {
+        RustString(ptr: __swift_bridge__$PcSession$next_file_transfer_event(ptr))
+    }
+
+    public func stop_file_transfer() {
+        __swift_bridge__$PcSession$stop_file_transfer(ptr)
     }
 
     public func device_info() throws -> RustString {

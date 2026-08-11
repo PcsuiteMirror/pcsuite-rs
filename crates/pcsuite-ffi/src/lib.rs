@@ -26,7 +26,7 @@ use std::sync::OnceLock;
 use tokio::runtime::Runtime;
 
 use pcsuite_core::{
-    config, pair, register, usb, ClipboardConfig, InputHandle, MouseAction, MouseButton,
+    cloud, config, pair, register, usb, ClipboardConfig, InputHandle, MouseAction, MouseButton,
     PhoneNotify, RegisterConfig, Registration, ScreenParams, ScreenStream, Session, UsbConfig,
 };
 
@@ -220,6 +220,36 @@ mod ffi {
         // `lip` = this machine's LAN IP to advertise in the QR; pass "" to auto-detect.
         // Render qr_url() as a QR for the phone to scan via PCSuite 扫码连接电脑.
         fn pcsuite_pair_begin(lip: String) -> PcPairing;
+
+        // ── vivo-account mode (opt-in; serverless never calls any of these) ──
+        //
+        // Select the identity mode: "serverless" (default — no server is ever
+        // contacted) or "vivo_account". Anything unrecognised means serverless.
+        // Call at startup, before connecting.
+        fn pcsuite_set_mode(mode: String);
+        // The active mode as a string, for the settings UI to read back.
+        fn pcsuite_mode() -> String;
+        // Hand the core the account credentials the QR login produced. Held in
+        // memory only — the app owns persistence (keychain). Empty values sign out.
+        fn pcsuite_cloud_set_account(open_id: String, token: String, country_code: String);
+        // This PC's cloud device id, SHA256(platform UUID)+serial. Same value the
+        // official client derives, so registering doesn't create a duplicate entry.
+        // Returns "" if it can't be read.
+        fn pcsuite_cloud_device_id() -> String;
+        // The super-clipboard PC id implied by that device id (its first 6 hex
+        // digits) — what pcsuite_set_clip_id should be given in account mode.
+        fn pcsuite_cloud_clip_pc_id() -> String;
+        // Register this PC with the connection center so the phone lists it.
+        // Blocks on the network — call off the main thread. Returns the deviceId.
+        fn pcsuite_cloud_register() -> Result<String, String>;
+        // The account's devices, one per line, tab-separated:
+        //   deviceId \t name \t model \t type \t reportTime \t ip \t externalId
+        // `type` 3 = PC, anything else = a phone/pad. The API has no online flag,
+        // so reportTime ("2026-08-11 10:59:09.374", or empty) is the only liveness
+        // hint. Blocks — call off the main thread. Empty = no devices.
+        fn pcsuite_cloud_devices() -> Result<String, String>;
+        // Remove this PC from the account (the phone stops listing it).
+        fn pcsuite_cloud_unregister() -> Result<String, String>;
     }
 
     extern "Rust" {
@@ -942,6 +972,82 @@ fn pcsuite_set_seed(phone_ip: String, seed: String) {
 
 fn pcsuite_set_clip_id(clip_id: String) {
     config::set_clip_pc_id(clip_id);
+}
+
+// ───────────────────── vivo-account mode (opt-in) ─────────────────────
+//
+// The account lives here rather than in `config` because the app owns
+// persistence (keychain) and only hands the credentials over per launch.
+
+fn cloud_account() -> &'static std::sync::RwLock<cloud::Account> {
+    static A: OnceLock<std::sync::RwLock<cloud::Account>> = OnceLock::new();
+    A.get_or_init(Default::default)
+}
+
+fn pcsuite_set_mode(mode: String) {
+    config::set_mode(config::Mode::parse(&mode));
+}
+
+fn pcsuite_mode() -> String {
+    config::mode().as_str().to_string()
+}
+
+fn pcsuite_cloud_set_account(open_id: String, token: String, country_code: String) {
+    let mut a = cloud_account().write().unwrap();
+    a.open_id = open_id;
+    a.token = token;
+    a.country_code = if country_code.is_empty() { "cn".into() } else { country_code };
+}
+
+fn pcsuite_cloud_device_id() -> String {
+    cloud::pc_device_id().unwrap_or_default()
+}
+
+fn pcsuite_cloud_clip_pc_id() -> String {
+    cloud::derived_clip_pc_id().unwrap_or_default()
+}
+
+/// Refuse cloud calls unless the user actually chose account mode — a stale
+/// account in memory must never cause a request in serverless mode.
+fn cloud_center() -> Result<cloud::ConnectCenter, String> {
+    if !config::mode().uses_cloud() {
+        return Err("not in vivo-account mode".into());
+    }
+    let account = cloud_account().read().unwrap().clone();
+    cloud::ConnectCenter::new(account).map_err(|e| e.to_string())
+}
+
+fn pcsuite_cloud_register() -> Result<String, String> {
+    let cc = cloud_center()?;
+    rt().block_on(cc.register_self()).map_err(|e| format!("{e:#}"))?;
+    Ok(cc.device_id().to_string())
+}
+
+fn pcsuite_cloud_devices() -> Result<String, String> {
+    let cc = cloud_center()?;
+    let list = rt().block_on(cc.device_list()).map_err(|e| format!("{e:#}"))?;
+    Ok(list
+        .iter()
+        .map(|d| {
+            format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                d.device_id,
+                d.name,
+                d.model,
+                d.device_type,
+                d.report_time,
+                d.ip().unwrap_or(""),
+                d.external_id
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+fn pcsuite_cloud_unregister() -> Result<String, String> {
+    let cc = cloud_center()?;
+    rt().block_on(cc.unbind()).map_err(|e| format!("{e:#}"))?;
+    Ok(cc.device_id().to_string())
 }
 
 /// Cheap USB cable check — see [`pcsuite_core::usb::probe`]. Not cancellable: it

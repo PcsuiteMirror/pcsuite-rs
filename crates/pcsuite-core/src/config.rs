@@ -43,6 +43,45 @@ pub const CLIP_NICK: &str = "pcsuite";
 /// Fixed JSON `id` field used in ConnectFlow frames.
 pub const FRAME_ID: i64 = 87654321;
 
+/// Which identity source the app runs against. Chosen once by the user; every
+/// other behaviour follows from it.
+///
+/// - [`Mode::Serverless`] (default) — no vendor server is ever contacted. The
+///   identity values come from the config file / settings panel, and pairing is
+///   USB, a hand-entered LAN IP, or the local QR flow (`pair.rs`).
+/// - [`Mode::VivoAccount`] — the user signs in with a vivo account, which
+///   supplies the openId and registers this PC with the connection center (see
+///   [`crate::cloud`]) so the phone can list it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Mode {
+    #[default]
+    Serverless,
+    VivoAccount,
+}
+
+impl Mode {
+    /// Parse the wire/config spelling; anything unrecognised is serverless, so a
+    /// typo can never silently opt a user into contacting a server.
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "vivo" | "vivo_account" | "vivoaccount" | "account" | "cloud" => Mode::VivoAccount,
+            _ => Mode::Serverless,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mode::Serverless => "serverless",
+            Mode::VivoAccount => "vivo_account",
+        }
+    }
+
+    /// Whether this mode is allowed to make cloud requests.
+    pub fn uses_cloud(self) -> bool {
+        self == Mode::VivoAccount
+    }
+}
+
 /// Runtime identity + pairing seeds, parsed once from env / config file.
 struct UserConfig {
     open_id: String,
@@ -54,6 +93,7 @@ struct UserConfig {
     default_seed: Option<String>,
     /// Per-IP stored pairing seeds (`ip` -> seed UUID).
     seeds: HashMap<String, String>,
+    mode: Mode,
 }
 
 fn load() -> &'static UserConfig {
@@ -88,6 +128,7 @@ fn load() -> &'static UserConfig {
             clip_pc_id: pick("PCSUITE_CLIP_PC_ID", "clip_pc_id", CLIP_PC_ID_DEFAULT),
             default_seed,
             seeds,
+            mode: Mode::parse(&pick("PCSUITE_MODE", "mode", Mode::Serverless.as_str())),
         }
     })
 }
@@ -136,6 +177,7 @@ struct Overrides {
     device_name: Option<String>,
     clip_pc_id: Option<String>,
     seeds: HashMap<String, String>,
+    mode: Option<Mode>,
 }
 
 fn overrides() -> &'static RwLock<Overrides> {
@@ -158,6 +200,17 @@ pub fn set_identity(open_id: String, pc_mac: String, account: String, device_nam
 /// the phone registered for this PC at pairing, or phone→PC clipboard won't push.
 pub fn set_clip_pc_id(id: String) {
     overrides().write().unwrap().clip_pc_id = (!id.is_empty()).then_some(id);
+}
+
+/// Select the identity mode at runtime (the settings panel does this at startup).
+pub fn set_mode(mode: Mode) {
+    overrides().write().unwrap().mode = Some(mode);
+}
+
+/// The active mode: runtime override, then `PCSUITE_MODE` / the config file's
+/// `"mode"`, then [`Mode::Serverless`].
+pub fn mode() -> Mode {
+    overrides().read().unwrap().mode.unwrap_or_else(|| load().mode)
 }
 
 /// Placeholder openId from the env/file/placeholder base — an obviously-fake value
@@ -224,4 +277,33 @@ pub fn default_stored_seed(ip: &str) -> Option<String> {
     }
     let c = load();
     c.seeds.get(ip).cloned().or_else(|| c.default_seed.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mode_spellings_map_to_vivo_account() {
+        for s in ["vivo", "vivo_account", "vivoAccount", "account", "cloud", " CLOUD "] {
+            assert_eq!(Mode::parse(s), Mode::VivoAccount, "{s:?}");
+        }
+    }
+
+    #[test]
+    fn unknown_mode_falls_back_to_serverless() {
+        // A typo must never silently opt the user into contacting a server.
+        for s in ["", "serverless", "vivoo", "local", "true"] {
+            assert_eq!(Mode::parse(s), Mode::Serverless, "{s:?}");
+        }
+        assert!(!Mode::Serverless.uses_cloud());
+        assert!(Mode::VivoAccount.uses_cloud());
+    }
+
+    #[test]
+    fn mode_round_trips_through_its_string_form() {
+        for m in [Mode::Serverless, Mode::VivoAccount] {
+            assert_eq!(Mode::parse(m.as_str()), m);
+        }
+    }
 }
