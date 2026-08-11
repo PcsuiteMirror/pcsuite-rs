@@ -14,6 +14,7 @@
 
 pub mod clip;
 pub mod connect;
+pub mod filetrans;
 pub mod input;
 pub mod notify;
 pub mod payload1;

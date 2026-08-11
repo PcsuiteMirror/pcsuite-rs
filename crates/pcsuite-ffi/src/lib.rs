@@ -116,6 +116,30 @@ mod ffi {
         // Ask the notify poller to stop (mirror of stop_verify for notifications).
         fn stop_notify(&self);
 
+        // Upload local files to the phone (the desktop app's drag-and-drop path):
+        // drop_files_info + a streamed tar over the 10380 HTTP gateway. `save_dir`
+        // is the phone-side target directory ("" = the phone's default, observed
+        // "Download/vivo办公套件/"); duplicates are renamed, never overwritten.
+        // Directories are rejected (v1: regular files only). Blocks for the whole
+        // transfer — call off the main thread. Returns the phone-side directory
+        // the files landed in.
+        fn push_files(&self, paths: Vec<String>, save_dir: String) -> Result<String, String>;
+        // Arm the phone→PC receivers: (a) 快传 — the phone announces FILE_TRANS_TAG
+        // on the shared control WS, we pull the batch over the mdfs HTTP plane and
+        // ack on the same WS; (b) 互传 (EasyShare) — the phone connects to our
+        // 10191 listener and we pull a zip off its HTTP server (no FILE_TRANS_TAG;
+        // a bind failure on 10191 only disables this entry). Both feed the same
+        // event stream. Received files are written into `save_dir` (created
+        // if missing). Then poll next_file_transfer_event().
+        fn enable_file_transfer(&self, save_dir: String) -> Result<(), String>;
+        // Block for the next file-transfer event as a JSON object:
+        //   {"type":"started"|"done"|"failed"|"cancelled", "files":[names],
+        //    "dir": save_dir, "error": "…"}
+        // Empty = session ended OR stop_file_transfer() was called.
+        fn next_file_transfer_event(&self) -> String;
+        // Ask the file-transfer poller to stop (mirror of stop_notify).
+        fn stop_file_transfer(&self);
+
         // Fetch phone device facts (storage capacity, model, OS) via the 10380
         // /base-info gateway. Returns tab-separated fields, in order:
         //   name, brand, product, androidVersion, osVersion, widthPx, heightPx,
@@ -177,6 +201,13 @@ mod ffi {
         fn pcsuite_set_clip_id(clip_id: String);
         // Connect over USB (adb). Blocks a few seconds — call off the main thread.
         fn pcsuite_connect_usb() -> Result<PcSession, String>;
+        // Is a phone on the USB cable? A bare `adb devices` that touches nothing
+        // on the phone, for callers waiting on a cable rather than connecting.
+        // Returns "ready" (connect can proceed), "no-device" (nothing attached —
+        // keep waiting), "unauthorized" (attached, USB debugging not allowed yet)
+        // or "no-adb" (adb missing/broken — waiting is hopeless). Blocks up to a
+        // few seconds (adb may have to start its server): call off the main thread.
+        fn pcsuite_usb_probe() -> String;
         // Connect over LAN/Tailscale. remote=true uses connectType=1 (no seed).
         fn pcsuite_connect_lan(phone_ip: String, remote: bool) -> Result<PcSession, String>;
         // Abort an in-flight pcsuite_connect_usb / pcsuite_connect_lan / PcPaired
@@ -296,6 +327,13 @@ pub struct PcSession {
     // Notification relay — mirror of the verify channel/stop pair.
     notify_rx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<String>>>,
     notify_stop: std::sync::atomic::AtomicBool,
+    // File-transfer receiver — mirror of the notify channel/stop pair.
+    filetrans_rx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<String>>>,
+    filetrans_stop: std::sync::atomic::AtomicBool,
+    // 互传 (EasyShare) 10191 listener, armed by enable_file_transfer() alongside the
+    // 快传 receiver — both feed the same filetrans event channel. Dropped on stop /
+    // session teardown (its Drop aborts the accept loop).
+    share_recv: std::sync::Mutex<Option<pcsuite_core::ShareReceiver>>,
     // Cached phone mobileDeviceId for /base-info; resolved lazily without re-sending
     // a SHADOW startup when one is already on the wire (see resolve_device_id).
     device_id_cache: std::sync::Mutex<String>,
@@ -589,6 +627,118 @@ impl PcSession {
         self.notify_stop.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+    fn push_files(&self, paths: Vec<String>, save_dir: String) -> Result<String, String> {
+        use anyhow::Context;
+        if paths.is_empty() {
+            return Err("nothing to upload".to_string());
+        }
+        let mut items = Vec::with_capacity(paths.len());
+        for f in &paths {
+            let p = std::path::Path::new(f);
+            let md = std::fs::metadata(p).map_err(|e| format!("stat {f}: {e}"))?;
+            if !md.is_file() {
+                return Err(format!("{f}: 目录上传暂不支持，请只传普通文件"));
+            }
+            let name = p
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .with_context(|| format!("{f}: 无法取文件名"))
+                .map_err(|e| format!("{e:#}"))?;
+            let mtime_ms = md
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            items.push(pcsuite_core::mdfs::UploadItem {
+                local: p.to_path_buf(),
+                name,
+                size: md.len(),
+                mtime_ms,
+            });
+        }
+        let device_id = self.resolve_device_id()?;
+        rt().block_on(pcsuite_core::mdfs::upload_files(
+            &self.data_ip,
+            &self.token,
+            &device_id,
+            &save_dir,
+            false, // ifDuplicated = rename
+            &items,
+        ))
+        .map_err(|e| format!("{e:#}"))?;
+        // upload_files doesn't report the resolved dir; give back what we asked
+        // for, or the phone's observed default when it chose.
+        Ok(if save_dir.is_empty() {
+            "Download/vivo办公套件/".to_string()
+        } else {
+            save_dir
+        })
+    }
+
+    fn enable_file_transfer(&self, save_dir: String) -> Result<(), String> {
+        let device_id = self.resolve_device_id()?;
+        self.filetrans_stop
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        *self.filetrans_rx.lock().unwrap() = Some(rx);
+        let cfg = pcsuite_core::FileTransConfig {
+            data_ip: self.data_ip.clone(),
+            token: self.token.clone(),
+            device_id,
+            save_dir: save_dir.clone(),
+        };
+        let tx2 = tx.clone();
+        rt().block_on(async {
+            let mut s = self.session.lock().await;
+            s.enable_file_trans(cfg, move |ev| {
+                let _ = tx.send(ev.to_json());
+            });
+            // 互传 (EasyShare): the phone connects to *our* 10191 and we pull a zip
+            // over its HTTP server — no FILE_TRANS_TAG involved. Arm the listener
+            // here so one switch covers both receive entries. A bind failure (port
+            // taken by the official service / a probe) only disables 互传: it is
+            // logged and 快传 keeps working.
+            let share_cfg = pcsuite_core::ShareConfig { save_dir };
+            match pcsuite_core::ShareReceiver::start(share_cfg, move |ev| {
+                let _ = tx2.send(ev.to_json());
+            })
+            .await
+            {
+                Ok(recv) => *self.share_recv.lock().unwrap() = Some(recv),
+                Err(e) => tracing::warn!(err = %format!("{e:#}"), "互传 receiver unavailable"),
+            }
+        });
+        Ok(())
+    }
+
+    fn next_file_transfer_event(&self) -> String {
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+        let rx = self.filetrans_rx.lock().unwrap().take();
+        let Some(mut rx) = rx else { return String::new() };
+        let msg = rt().block_on(async {
+            loop {
+                if self.filetrans_stop.load(Ordering::Relaxed) {
+                    return None;
+                }
+                match tokio::time::timeout(Duration::from_millis(300), rx.recv()).await {
+                    Ok(v) => return v, // Some(json) or None (channel closed)
+                    Err(_) => continue,
+                }
+            }
+        });
+        *self.filetrans_rx.lock().unwrap() = Some(rx);
+        msg.unwrap_or_default()
+    }
+
+    fn stop_file_transfer(&self) {
+        self.filetrans_stop
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // 互传 listener 一并停掉（Drop aborts the 10191 accept loop）。
+        *self.share_recv.lock().unwrap() = None;
+    }
+
     fn device_info(&self) -> Result<String, String> {
         let device_id = self.resolve_device_id()?;
         let info = rt()
@@ -794,6 +944,12 @@ fn pcsuite_set_clip_id(clip_id: String) {
     config::set_clip_pc_id(clip_id);
 }
 
+/// Cheap USB cable check — see [`pcsuite_core::usb::probe`]. Not cancellable: it
+/// runs one short `adb devices` and never opens a socket.
+fn pcsuite_usb_probe() -> String {
+    rt().block_on(usb::probe(None)).as_str().to_string()
+}
+
 fn pcsuite_connect_usb() -> Result<PcSession, String> {
     let id = config::default_identity();
     let (u, session) = block_on_cancellable(async {
@@ -823,6 +979,9 @@ fn pcsuite_connect_usb() -> Result<PcSession, String> {
         verify_stop: std::sync::atomic::AtomicBool::new(false),
         notify_rx: std::sync::Mutex::new(None),
         notify_stop: std::sync::atomic::AtomicBool::new(false),
+        filetrans_rx: std::sync::Mutex::new(None),
+        filetrans_stop: std::sync::atomic::AtomicBool::new(false),
+        share_recv: std::sync::Mutex::new(None),
         device_id_cache: std::sync::Mutex::new(String::new()),
         clipboard_active: std::sync::atomic::AtomicBool::new(false),
         dead_rx: tokio::sync::Mutex::new(dead_rx),
@@ -884,6 +1043,9 @@ fn build_wlan_session(
         verify_stop: std::sync::atomic::AtomicBool::new(false),
         notify_rx: std::sync::Mutex::new(None),
         notify_stop: std::sync::atomic::AtomicBool::new(false),
+        filetrans_rx: std::sync::Mutex::new(None),
+        filetrans_stop: std::sync::atomic::AtomicBool::new(false),
+        share_recv: std::sync::Mutex::new(None),
         device_id_cache: std::sync::Mutex::new(String::new()),
         clipboard_active: std::sync::atomic::AtomicBool::new(false),
         dead_rx: tokio::sync::Mutex::new(dead_rx),

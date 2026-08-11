@@ -13,6 +13,7 @@
 //! list immediately (unlike the vdfs plane). [`list`] enumerates a media/file
 //! category; the resulting `savePath`s feed [`crate::vdfs::fetch`] for download.
 
+use std::io::Write;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -166,11 +167,41 @@ pub async fn download(host: &str, token: &str, device_id: &str, save_path: &str)
     // A unique per-request transfer id correlates the two calls (the desktop app uses
     // an arbitrary id; the phone only needs the same value on both requests).
     let id = format!("pcsuite-{:08x}", fnv1a(save_path.as_bytes()));
+    let tar = download_tar(host, token, device_id, &id, &[save_path], 0).await?;
+    untar_first(&tar).with_context(|| format!("download tar had no file entry for {save_path}"))
+}
 
+/// Download a whole batch of phone files (phone→PC「快传」flow): registers with a
+/// fresh transfer id and the declared summed size, streams the tar, and extracts
+/// **every** entry as `(tar entry name, bytes)`.
+pub async fn download_batch(
+    host: &str,
+    token: &str,
+    device_id: &str,
+    paths: &[String],
+    total: u64,
+) -> Result<Vec<(String, Vec<u8>)>> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+    let tar = download_tar(host, token, device_id, &id, &refs, total).await?;
+    untar_all(&tar)
+}
+
+/// The two-step mdfs download (`download_info` + `download`), returning the raw
+/// tar bytes. `id` correlates the two requests (any unique string); `total` is the
+/// summed size the phone announced (0 is accepted by the `pull` path).
+pub async fn download_tar(
+    host: &str,
+    token: &str,
+    device_id: &str,
+    id: &str,
+    paths: &[&str],
+    total: u64,
+) -> Result<Vec<u8>> {
     let info = json!({
-        "downloadList": [save_path],
+        "downloadList": paths,
         "type": "FROM_PC_FILE_MANAGER",
-        "total": 0,
+        "total": total,
     });
     let (st, resp) = http_request(
         host,
@@ -205,8 +236,7 @@ pub async fn download(host: &str, token: &str, device_id: &str, save_path: &str)
         let snippet: String = String::from_utf8_lossy(&body).trim().chars().take(160).collect();
         bail!("mdfs download -> HTTP {st2}: {snippet}");
     }
-
-    untar_first(&body).with_context(|| format!("download tar had no file entry for {save_path}"))
+    Ok(body)
 }
 
 /// FNV-1a 32-bit — a tiny stable hash for the transfer id (no extra deps).
@@ -217,6 +247,295 @@ fn fnv1a(bytes: &[u8]) -> u32 {
         h = h.wrapping_mul(0x0100_0193);
     }
     h
+}
+
+// ---------------------------------------------------------------------------
+// Upload (PC → phone): drop_files_info + /upload/drop_file_to_phone (tar push)
+// ---------------------------------------------------------------------------
+
+/// Registration step timeout (matches the official app's upload-register budget).
+const UPLOAD_REGISTER_TIMEOUT: Duration = Duration::from_secs(300);
+/// Final server ack can lag while the phone finishes untarring/scanning media —
+/// the official app allows an hour. No read-idle timeout applies mid-transfer
+/// (the connection is legitimately silent while we stream).
+const UPLOAD_ACK_TIMEOUT: Duration = Duration::from_secs(3600);
+/// Flush the chunked body at roughly this granularity.
+const CHUNK_TARGET: usize = 64 * 1024;
+
+/// One local file queued for upload. Directories are not supported (v1).
+#[derive(Debug, Clone)]
+pub struct UploadItem {
+    /// Local filesystem path of a regular file.
+    pub local: std::path::PathBuf,
+    /// Tar entry name = basename (flat, no directory hierarchy).
+    pub name: String,
+    pub size: u64,
+    /// Modification time, epoch ms (0 if unknown).
+    pub mtime_ms: i64,
+}
+
+/// Upload local files to the phone (desktop app's drag-and-drop path). Two steps
+/// on the 10380 gateway:
+///   1. `POST /pc_file_manager/drop_files_info` — registers the batch
+///      (`TO_PC_FILE_MANAGER`, per-item metadata, `ifDuplicated` policy).
+///   2. `POST /upload/drop_file_to_phone?id=<same>&type=tar` — streams a single
+///      ustar tar (one entry per file, flat basenames) as HTTP chunked, *without*
+///      pre-building it in memory.
+/// `save_dir` is the phone-side target directory ("" = phone default; observed
+/// `Download/vivo办公套件/` on a V2505A).
+/// `overwrite` picks the `ifDuplicated` policy (`overwrite` vs. `rename`).
+/// Success requires `HTTP 200` **and** a JSON ack with `status == 0`.
+pub async fn upload_files(
+    host: &str,
+    token: &str,
+    device_id: &str,
+    save_dir: &str,
+    overwrite: bool,
+    items: &[UploadItem],
+) -> Result<()> {
+    if items.is_empty() {
+        bail!("nothing to upload");
+    }
+    // The tar stream must not sit in memory: build it on the fly over a blocking
+    // socket on a blocking thread (tokio's TcpStream has no sync Write impl).
+    let host = host.to_string();
+    let token = token.to_string();
+    let device_id = device_id.to_string();
+    let save_dir = save_dir.to_string();
+    let items = items.to_vec();
+    tokio::task::spawn_blocking(move || {
+        upload_blocking(&host, &token, &device_id, &save_dir, overwrite, &items)
+    })
+    .await
+    .context("upload task join")?
+}
+
+fn upload_blocking(
+    host: &str,
+    token: &str,
+    device_id: &str,
+    save_dir: &str,
+    overwrite: bool,
+    items: &[UploadItem],
+) -> Result<()> {
+    use std::io::Write;
+    use std::net::TcpStream as StdTcpStream;
+
+    let addr = (host, CONTROL_PORT);
+    let connect = || -> Result<StdTcpStream> {
+        let s = StdTcpStream::connect_timeout(
+            &std::net::ToSocketAddrs::to_socket_addrs(&addr)?
+                .next()
+                .with_context(|| format!("resolve {host}:{CONTROL_PORT}"))?,
+            CONNECT_TIMEOUT,
+        )
+        .with_context(|| format!("connect {host}:{CONTROL_PORT}"))?;
+        s.set_nodelay(true).ok();
+        Ok(s)
+    };
+
+    // --- Step 1: register the drop batch ---
+    let id = uuid::Uuid::new_v4().to_string();
+    let policy = if overwrite { "overwrite" } else { "rename" };
+    let drop_items: Vec<Value> = items
+        .iter()
+        .map(|it| {
+            json!({
+                "index": -1,
+                "isDirectory": false,
+                "fileName": it.name,
+                "fileSize": it.size,
+                "savePath": "",
+                "date": it.mtime_ms,
+                "fileType": "UNKNOWN",
+                "mimeType": "",
+                "ifDuplicated": policy,
+            })
+        })
+        .collect();
+    let info = json!({
+        "id": id,
+        "type": "TO_PC_FILE_MANAGER",
+        "savePath": save_dir,
+        "totalSize": items.iter().map(|it| it.size).sum::<u64>(),
+        "totalCount": items.len(),
+        "screen_w": 0,
+        "screen_h": 0,
+        "x": 0,
+        "y": 0,
+        "dropFileItems": drop_items,
+    });
+    let payload = serde_json::to_vec(&info)?;
+
+    let mut s = connect()?;
+    let head = format!(
+        "POST /pc_file_manager/drop_files_info HTTP/1.1\r\nHost: {host}:{CONTROL_PORT}\r\n\
+         newToken: {token}\r\ndeviceId: {device_id}\r\nX-ES-HTTP-VERSION: 1\r\n\
+         Accept: application/json\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n",
+        payload.len()
+    );
+    s.write_all(head.as_bytes())?;
+    s.write_all(&payload)?;
+    s.flush()?;
+    let buf = read_http_response(&mut s, UPLOAD_REGISTER_TIMEOUT).context("drop_files_info reply")?;
+    let (status, resp) = parse_http(&buf);
+    if status != 200 {
+        // Failure replies are plain text (e.g. "is not valid save directory.").
+        let body = String::from_utf8_lossy(&resp).trim().to_string();
+        bail!("drop_files_info -> HTTP {status}: {body}");
+    }
+    tracing::info!(id = %id, files = items.len(), "drop batch registered");
+
+    // --- Step 2: stream the tar as HTTP chunked ---
+    let mut s = connect()?;
+    let head = format!(
+        "POST /upload/drop_file_to_phone?id={id}&type=tar HTTP/1.1\r\n\
+         Host: {host}:{CONTROL_PORT}\r\n\
+         newToken: {token}\r\ndeviceId: {device_id}\r\nX-ES-HTTP-VERSION: 1\r\n\
+         Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+    );
+    s.write_all(head.as_bytes())?;
+    {
+        let cw = ChunkedWriter::new(&mut s);
+        let mut builder = tar::Builder::new(cw);
+        for it in items {
+            // Real stat for mode/mtime; the crate emits GNU longname/pax headers
+            // itself for names over 100 bytes (e.g. CJK basenames).
+            builder
+                .append_path_with_name(&it.local, &it.name)
+                .with_context(|| format!("tar append {}", it.local.display()))?;
+            tracing::info!(name = %it.name, size = it.size, "…streaming");
+        }
+        let cw = builder.into_inner().context("tar finish")?;
+        cw.finish().context("chunked terminator")?;
+    }
+    s.flush()?;
+
+    // The phone untars on the fly, then acks; media scanning runs by itself.
+    let buf = read_http_response(&mut s, UPLOAD_ACK_TIMEOUT).context("upload reply")?;
+    let (status, resp) = parse_http(&buf);
+    let ack: Option<Value> = serde_json::from_slice(&resp).ok();
+    let ok = status == 200 && ack.as_ref().and_then(|v| v.get("status")).and_then(Value::as_i64) == Some(0);
+    if !ok {
+        let body = String::from_utf8_lossy(&resp).trim().chars().take(200).collect::<String>();
+        bail!("drop_file_to_phone -> HTTP {status}: {body}");
+    }
+    Ok(())
+}
+
+/// Read one HTTP response from a blocking socket without assuming the peer closes
+/// the connection: `Connection: close` is honored by the phone's *other* routes,
+/// but the upload handlers answer and keep the socket open, so a bare
+/// `read_to_end` would stall until the deadline and throw away a perfectly good
+/// reply. Returns as soon as the buffered bytes form a complete response
+/// (headers + Content-Length body / chunk terminator), on EOF, or when
+/// `overall` elapses (error only if nothing arrived at all).
+fn read_http_response(s: &mut std::net::TcpStream, overall: Duration) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let deadline = std::time::Instant::now() + overall;
+    s.set_read_timeout(Some(Duration::from_secs(3))).ok(); // poll granularity, not an idle cap
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 16384];
+    loop {
+        if http_response_complete(&buf) {
+            return Ok(buf);
+        }
+        if std::time::Instant::now() >= deadline {
+            if buf.is_empty() {
+                bail!("no reply within {overall:?}");
+            }
+            return Ok(buf); // partial/bare reply — let parse_http judge
+        }
+        match s.read(&mut tmp) {
+            Ok(0) => return Ok(buf), // EOF: peer closed
+            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) => return Err(e).context("read reply"),
+        }
+    }
+}
+
+/// Is `buf` a full HTTP response? Header block + body per `Content-Length` or the
+/// chunked terminator. A bare non-HTTP reply (the router's plain `NotFound`
+/// style) counts as complete on any data; a header block with no length hint is
+/// treated as complete (acks are JSON with a length or chunked).
+fn http_response_complete(buf: &[u8]) -> bool {
+    if buf.is_empty() {
+        return false;
+    }
+    let Some(sep) = find(buf, b"\r\n\r\n") else {
+        return !buf.starts_with(b"HTTP/");
+    };
+    let head = String::from_utf8_lossy(&buf[..sep]).to_lowercase();
+    let body = &buf[sep + 4..];
+    if head
+        .lines()
+        .any(|l| l.starts_with("transfer-encoding:") && l.contains("chunked"))
+    {
+        return find(body, b"\r\n0\r\n\r\n").is_some() || body.starts_with(b"0\r\n\r\n");
+    }
+    if let Some(cl) = head
+        .lines()
+        .find_map(|l| l.strip_prefix("content-length:").and_then(|v| v.trim().parse::<usize>().ok()))
+    {
+        return body.len() >= cl;
+    }
+    true
+}
+
+/// `std::io::Write` adapter that frames each buffered write as an HTTP/1.1 chunk
+/// (`%x\r\n<data>\r\n`) straight onto the underlying stream; [`ChunkedWriter::finish`]
+/// emits the `0\r\n\r\n` terminator. Lets `tar::Builder` stream onto the socket
+/// without materializing the archive.
+struct ChunkedWriter<W: Write> {
+    inner: W,
+    buf: Vec<u8>,
+}
+
+impl<W: Write> ChunkedWriter<W> {
+    fn new(inner: W) -> Self {
+        ChunkedWriter {
+            inner,
+            buf: Vec::with_capacity(CHUNK_TARGET * 2),
+        }
+    }
+
+    /// Flush any buffered data as one chunk, then write the terminal zero chunk.
+    fn finish(mut self) -> std::io::Result<()> {
+        self.flush_buf()?;
+        self.inner.write_all(b"0\r\n\r\n")?;
+        self.inner.flush()
+    }
+
+    fn flush_buf(&mut self) -> std::io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let head = format!("{:x}\r\n", self.buf.len());
+        self.inner.write_all(head.as_bytes())?;
+        self.inner.write_all(&self.buf)?;
+        self.inner.write_all(b"\r\n")?;
+        self.buf.clear();
+        Ok(())
+    }
+}
+
+impl<W: Write> Write for ChunkedWriter<W> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.buf.extend_from_slice(data);
+        if self.buf.len() >= CHUNK_TARGET {
+            self.flush_buf()?;
+        }
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.flush_buf()?;
+        self.inner.flush()
+    }
 }
 
 /// One plain-HTTP request to the connection server, with the `newToken`/`deviceId`
@@ -332,6 +651,53 @@ fn untar_first(data: &[u8]) -> Result<Vec<u8>> {
         off += data_blocks;
     }
     bail!("no regular file entry in tar ({} bytes)", data.len())
+}
+
+/// Extract **every** regular-file entry from a tar archive as `(name, bytes)`
+/// (the phone→PC「快传」batch ships one entry per requested path). Handles GNU
+/// longname entries (`L`) so CJK/超长文件名 keep their real name; skips pax/global
+/// extended headers (`x`/`g`) and directories. Zero-length files are kept.
+pub fn untar_all(data: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
+    let mut out = Vec::new();
+    let mut off = 0usize;
+    let mut longname: Option<String> = None;
+    while off + 512 <= data.len() {
+        let hdr = &data[off..off + 512];
+        if hdr.iter().all(|&b| b == 0) {
+            break; // end-of-archive marker
+        }
+        let size = tar_octal(&hdr[124..136]);
+        let typeflag = hdr[156];
+        off += 512;
+        let data_blocks = size.div_ceil(512) * 512;
+        match typeflag {
+            // GNU longname: this entry's data is the next entry's real name.
+            b'L' => {
+                let end = (off + size).min(data.len());
+                let raw = &data[off..end];
+                let nul = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+                longname = Some(String::from_utf8_lossy(&raw[..nul]).into_owned());
+            }
+            b'0' | 0 => {
+                let name = longname.take().unwrap_or_else(|| tar_name(hdr));
+                let end = (off + size).min(data.len());
+                out.push((name, data[off..end].to_vec()));
+            }
+            _ => {} // 'x'/'g' extended headers, dirs ('5'), links, … — skip
+        }
+        off += data_blocks;
+    }
+    if out.is_empty() {
+        bail!("no regular file entry in tar ({} bytes)", data.len());
+    }
+    Ok(out)
+}
+
+/// Read the plain name field of a tar header (up to the first NUL).
+fn tar_name(hdr: &[u8]) -> String {
+    let raw = &hdr[..100];
+    let nul = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+    String::from_utf8_lossy(&raw[..nul]).into_owned()
 }
 
 /// Parse a tar header octal field (space/NUL terminated).
@@ -456,5 +822,94 @@ mod tests {
         assert_eq!(e[0].name, "s.jpg");
         assert_eq!(e[0].dir_name, "截屏");
         assert_eq!(e[0].mime, "image/jpeg");
+    }
+
+    #[test]
+    fn chunked_writer_frames_chunks() {
+        let mut out: Vec<u8> = Vec::new();
+        {
+            let mut cw = ChunkedWriter::new(&mut out);
+            cw.write_all(b"Wiki").unwrap();
+            cw.write_all(b"pedia").unwrap();
+            cw.flush().unwrap(); // explicit flush frames "Wikipedia" as one chunk
+            cw.write_all(b"!").unwrap();
+            cw.finish().unwrap();
+        }
+        assert_eq!(out, b"9\r\nWikipedia\r\n1\r\n!\r\n0\r\n\r\n");
+        // …and the framed body round-trips through dechunk.
+        assert_eq!(dechunk(&out), b"Wikipedia!");
+    }
+
+    #[test]
+    fn chunked_writer_splits_large_writes() {
+        let mut out: Vec<u8> = Vec::new();
+        let big = vec![7u8; CHUNK_TARGET + 10];
+        {
+            let mut cw = ChunkedWriter::new(&mut out);
+            cw.write_all(&big).unwrap(); // crosses the flush threshold internally
+            cw.finish().unwrap();
+        }
+        // One oversize chunk (the whole buffered write), then the terminator.
+        assert!(out.starts_with(format!("{:x}\r\n", big.len()).as_bytes()));
+        assert!(out.ends_with(b"\r\n0\r\n\r\n"));
+        assert_eq!(dechunk(&out), big);
+    }
+
+    /// Build a minimal ustar archive from `(name, bytes)` pairs (+ optional GNU
+    /// longname for the second entry).
+    fn make_tar(entries: &[(&str, &[u8])], longname: Option<&str>) -> Vec<u8> {
+        let mut tar = Vec::new();
+        let mut push_entry = |name: &str, data: &[u8], typeflag: u8| {
+            let mut hdr = vec![0u8; 512];
+            hdr[..name.len()].copy_from_slice(name.as_bytes());
+            let sz = format!("{:011o}\0", data.len());
+            hdr[124..136].copy_from_slice(sz.as_bytes());
+            hdr[156] = typeflag;
+            hdr[257..262].copy_from_slice(b"ustar");
+            tar.extend_from_slice(&hdr);
+            let mut block = vec![0u8; data.len().div_ceil(512) * 512];
+            block[..data.len()].copy_from_slice(data);
+            tar.extend_from_slice(&block);
+        };
+        for (i, (name, data)) in entries.iter().enumerate() {
+            if i == 1 {
+                if let Some(ln) = longname {
+                    push_entry("././@LongLink", ln.as_bytes(), b'L');
+                }
+            }
+            push_entry(name, data, b'0');
+        }
+        tar.extend_from_slice(&[0u8; 1024]); // end-of-archive
+        tar
+    }
+
+    #[test]
+    fn http_response_complete_detection() {
+        assert!(!http_response_complete(b""));
+        assert!(!http_response_complete(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n{\"a\":"));
+        assert!(http_response_complete(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\n{\"a\":1}"));
+        assert!(http_response_complete(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n"));
+        assert!(!http_response_complete(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n"));
+        // 裸非 HTTP 回复（路由层 NotFound 风格）一来数据就算完整。
+        assert!(http_response_complete(b"NotFound"));
+    }
+
+    #[test]
+    fn untar_all_extracts_every_entry() {
+        let tar = make_tar(&[("a.txt", b"hello"), ("b.txt", b""), ("c.txt", b"world!")], None);
+        let got = untar_all(&tar).unwrap();
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0], ("a.txt".to_string(), b"hello".to_vec()));
+        assert_eq!(got[1], ("b.txt".to_string(), Vec::new()), "zero-length file kept");
+        assert_eq!(got[2], ("c.txt".to_string(), b"world!".to_vec()));
+    }
+
+    #[test]
+    fn untar_all_honors_gnu_longname() {
+        let tar = make_tar(&[("a.txt", b"x"), ("short", b"yy")], Some("很长的中文文件名.pdf"));
+        let got = untar_all(&tar).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[1].0, "很长的中文文件名.pdf");
+        assert_eq!(got[1].1, b"yy");
     }
 }

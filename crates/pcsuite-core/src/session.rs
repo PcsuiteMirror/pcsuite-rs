@@ -22,6 +22,7 @@ use pcsuite_proto::screen::ScreenParams;
 
 use crate::clipboard::{self, ClipboardBackend, ClipboardConfig};
 use crate::config;
+use crate::filetrans::FileTransConfig;
 use crate::screen::InputHandle;
 use crate::wsconn::{open_ws, Tls};
 
@@ -30,8 +31,9 @@ use crate::wsconn::{open_ws, Tls};
 pub struct ControlHandle {
     out_tx: mpsc::Sender<String>,
     in_tx: broadcast::Sender<String>,
-    /// Most recent `SHADOW_LIKE:` message, retained so a feature that subscribes
-    /// slightly late (the phone announces its key very fast) doesn't miss it.
+    /// Most recent phone `SHADOW_LIKE:` announcement (parseable, carrying
+    /// mobileDeviceInfo), retained so a feature that subscribes slightly late
+    /// (the phone announces its key very fast) doesn't miss it.
     last_shadow: Arc<Mutex<Option<String>>>,
 }
 
@@ -47,7 +49,7 @@ impl ControlHandle {
     pub fn subscribe(&self) -> broadcast::Receiver<String> {
         self.in_tx.subscribe()
     }
-    /// The most recent retained `SHADOW_LIKE:` message, if any.
+    /// The most recent retained phone `SHADOW_LIKE:` announcement, if any.
     pub fn last_shadow(&self) -> Option<String> {
         self.last_shadow.lock().ok().and_then(|g| g.clone())
     }
@@ -220,6 +222,17 @@ impl Session {
         let control = self.control.clone();
         self.tasks
             .push(tokio::spawn(crate::notify::notify_feature(control, on_notify)));
+    }
+
+    /// Enable the phone→PC「快传」receiver; `on_event` fires for each batch step
+    /// (started / done / failed / cancelled). Shares the one control WS.
+    pub fn enable_file_trans<F>(&mut self, cfg: FileTransConfig, on_event: F)
+    where
+        F: Fn(crate::filetrans::FileTransEvent) + Send + 'static,
+    {
+        let control = self.control.clone();
+        self.tasks
+            .push(tokio::spawn(crate::filetrans::filetrans_feature(control, cfg, on_event)));
     }
 
     /// Enable text clipboard sync (8904 relay + SHADOW_LIKE over the shared WS).
@@ -416,10 +429,20 @@ async fn control_task(
     'run: loop {
         match timeout(Duration::from_millis(200), ws.recv()).await {
             Ok(Ok(WsFrame::Text(t))) => {
-                if t.starts_with("SHADOW_LIKE:") {
+                // Retain only genuine phone announcements (the ones carrying
+                // mobileDeviceInfo). Anything else that starts with the prefix —
+                // e.g. an echo of our own startup/ready — would overwrite the good
+                // reply and starve known_device_id() hours later.
+                if t.starts_with("SHADOW_LIKE:") && clip::parse_shadow_reply(&t).is_some() {
                     if let Ok(mut g) = last_shadow.lock() {
                         *g = Some(t.clone());
                     }
+                }
+                // File-transfer debugging: surface any file-share related frame
+                // verbatim (matched or not) so a phone-initiated「快传」that our
+                // parser doesn't recognize still shows up in the log.
+                if t.contains("FILE") || t.contains("TRANS") {
+                    tracing::info!("[control] file-related frame: {}", &t[..t.len().min(500)]);
                 }
                 let _ = in_tx.send(t);
             }

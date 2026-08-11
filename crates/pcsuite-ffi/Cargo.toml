@@ -14,6 +14,7 @@ pcsuite-core = { path = "../pcsuite-core" }
 
 tokio.workspace = true
 anyhow.workspace = true
+tracing.workspace = true
 tracing-subscriber.workspace = true
 swift-bridge = "0.1"
 

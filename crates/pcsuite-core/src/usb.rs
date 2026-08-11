@@ -15,6 +15,7 @@ use anyhow::{bail, Context, Result};
 use rand::RngCore;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::process::Command;
 
 use crate::adb;
 
@@ -30,6 +31,73 @@ pub struct UsbConfig {
     /// the `/base-info` `pc_name` (see [`crate::device::fetch`]) — set both to the
     /// same value so the connect-time and connected names match.
     pub pc_name: Option<String>,
+}
+
+/// What a quick look at the cable says, without connecting — see [`probe`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsbLink {
+    /// A device is present and authorized: a connect can proceed.
+    Ready,
+    /// adb answered, but nothing usable is attached — no phone, or one still
+    /// `offline`. The normal resting state when the cable is simply unplugged.
+    NoDevice,
+    /// A phone is attached but USB debugging isn't authorized yet (it is showing,
+    /// or about to show, the RSA prompt).
+    Unauthorized,
+    /// The adb binary itself couldn't be run. USB can't work until that's fixed,
+    /// so a caller polling for a cable should stop rather than spin forever.
+    NoAdb,
+}
+
+impl UsbLink {
+    /// Stable token for the FFI boundary (Swift matches on these).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UsbLink::Ready => "ready",
+            UsbLink::NoDevice => "no-device",
+            UsbLink::Unauthorized => "unauthorized",
+            UsbLink::NoAdb => "no-adb",
+        }
+    }
+}
+
+/// Is there a phone on the cable right now?
+///
+/// A bare `adb devices` — no force-stop, no forwards, no app launch, nothing that
+/// touches the phone. [`prepare`] answers the same question, but only by failing
+/// with an adb diagnostic after having already disturbed things; a caller that is
+/// *waiting* for the user to plug a phone back in needs to ask cheaply and
+/// repeatedly, and needs to tell "no phone yet" (keep waiting) apart from "adb is
+/// missing" (waiting is hopeless).
+pub async fn probe(adb_path: Option<&str>) -> UsbLink {
+    let adb = adb::resolve_adb(adb_path);
+    // The first call may have to start the adb server, hence the generous bound.
+    let out = match tokio::time::timeout(
+        Duration::from_secs(10),
+        Command::new(&adb).args(["devices"]).output(),
+    )
+    .await
+    {
+        Ok(Ok(out)) if out.status.success() => out,
+        // Spawn failure (no adb on PATH) or a non-zero exit (e.g. a mismatched
+        // adb server): adb is unusable, and polling can't fix that.
+        Ok(_) => return UsbLink::NoAdb,
+        // A wedged adb server — not fatal, the next poll may well answer.
+        Err(_) => return UsbLink::NoDevice,
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let states: Vec<&str> = text
+        .lines()
+        .skip(1) // "List of devices attached"
+        .filter_map(|l| l.trim_end().split('\t').nth(1))
+        .collect();
+    if states.contains(&"device") {
+        UsbLink::Ready
+    } else if states.contains(&"unauthorized") {
+        UsbLink::Unauthorized
+    } else {
+        UsbLink::NoDevice
+    }
 }
 
 /// Result of a successful [`prepare`]: drive `Screen::open("127.0.0.1", &token, …)`.

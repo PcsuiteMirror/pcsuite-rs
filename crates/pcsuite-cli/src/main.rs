@@ -51,6 +51,12 @@ struct Args {
     list_type: Option<String>,
     /// `pull` phone-side absolute path.
     path: Option<String>,
+    /// `push` local files (positional args).
+    files: Vec<String>,
+    /// `push` phone-side target directory ("" = phone default).
+    to: Option<String>,
+    /// `push` duplicate-name policy: overwrite instead of rename.
+    overwrite: bool,
 }
 
 fn parse_args() -> Args {
@@ -74,6 +80,9 @@ fn parse_args() -> Args {
         feat_notify: false,
         list_type: None,
         path: None,
+        files: Vec::new(),
+        to: None,
+        overwrite: false,
     };
     let mut i = 1;
     while i < raw.len() {
@@ -119,7 +128,17 @@ fn parse_args() -> Args {
                 i += 1;
                 a.path = raw.get(i).cloned();
             }
-            _ => {}
+            "--to" => {
+                i += 1;
+                a.to = raw.get(i).cloned();
+            }
+            "--overwrite" => a.overwrite = true,
+            _ => {
+                // Positional args (push 的本地文件列表)；未知 --flag 照旧忽略。
+                if !flag.starts_with("--") {
+                    a.files.push(flag);
+                }
+            }
         }
         i += 1;
     }
@@ -139,8 +158,11 @@ fn print_help() {
          pcsuite info (--usb | --phone <IP> [--remote])   (device model/OS + storage capacity)\n  \
          pcsuite ls (--usb | --phone <IP> [--remote]) [--type recent|image|video|audio|file|doc|home]\n  \
          pcsuite pull (--usb | --phone <IP> [--remote]) --path <phone-path> [--out <file>]\n  \
+         pcsuite push (--usb | --phone <IP> [--remote]) <local-file...> [--to <手机目录>] [--overwrite]\n  \
+         pcsuite recv (--usb | --phone <IP> [--remote]) [--out <本地目录> 默认 ~/Downloads]\n  \
+         pcsuite share-recv [--out <本地目录>]   (互传/EasyShare 接收：独立 10191 监听，无需连接会话)\n  \
          pcsuite all (--usb | --phone <IP> [--remote]) [--screen|--clipboard|--verify|--notify] \
-         [--seconds <N>] [--out <f>]\n\
+         [--seconds <N>] [--out <f>]\n  \
          \x20                                       (clipboard+verify+notify in the background; type\n\
          \x20                                        `screen on`/`screen off` at the prompt to\n\
          \x20                                        toggle mirroring. --screen starts it on.)\n\n\
@@ -173,6 +195,9 @@ async fn main() -> Result<()> {
         "info" => cmd_info(args).await,
         "ls" => cmd_ls(args).await,
         "pull" => cmd_pull(args).await,
+        "push" => cmd_push(args).await,
+        "recv" => cmd_recv(args).await,
+        "share-recv" => cmd_share_recv(args).await,
         "all" => cmd_all(args).await,
         "" | "help" | "-h" | "--help" => {
             print_help();
@@ -791,6 +816,207 @@ async fn cmd_pull(args: Args) -> Result<()> {
     std::fs::write(&out, &bytes).with_context(|| format!("write {out}"))?;
     println!("✅ pulled {} → {out} ({} bytes)", path, bytes.len());
     Ok(())
+}
+
+/// Upload local files to the phone (desktop 拖拽上传路径): `drop_files_info` 登记 +
+/// `/upload/drop_file_to_phone` 流式 tar(chunked)。v1 只收普通文件。
+async fn cmd_push(args: Args) -> Result<()> {
+    let identity = config::default_identity();
+    if args.files.is_empty() {
+        anyhow::bail!("用法: pcsuite push (--usb | --phone <IP> [--remote]) <本地文件...> [--to <手机目录>] [--overwrite]");
+    }
+
+    let mut items = Vec::with_capacity(args.files.len());
+    for f in &args.files {
+        let p = std::path::Path::new(f);
+        let md = std::fs::metadata(p).with_context(|| format!("stat {f}"))?;
+        if md.is_dir() {
+            anyhow::bail!("{f}: 目录上传暂不支持（后续版本），请只传普通文件");
+        }
+        if !md.is_file() {
+            anyhow::bail!("{f}: 不是普通文件");
+        }
+        let name = p
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .with_context(|| format!("{f}: 无法取文件名"))?;
+        let mtime_ms = md
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        items.push(mdfs::UploadItem {
+            local: p.to_path_buf(),
+            name,
+            size: md.len(),
+            mtime_ms,
+        });
+    }
+
+    let t = resolve_transport(&args, "push").await?;
+    let session = Session::connect(&t.data_ip, &t.token).await?;
+    let phone = session.phone_info(&t.pc_ip, &t.connect_type, &identity).await?;
+    let total: u64 = items.iter().map(|it| it.size).sum();
+    tracing::info!(device = %phone.mobile_device_id, files = items.len(), bytes = total, "pushing");
+
+    let result = mdfs::upload_files(
+        &t.data_ip,
+        &t.token,
+        &phone.mobile_device_id,
+        args.to.as_deref().unwrap_or(""),
+        args.overwrite,
+        &items,
+    )
+    .await;
+    drop(session);
+    cleanup_transport(&t, false).await;
+
+    result?;
+    let dest = args.to.as_deref().unwrap_or("手机默认目录(Download/vivo办公套件)");
+    println!(
+        "✅ pushed {} file(s) ({}) → {dest}",
+        items.len(),
+        human_size(total)
+    );
+    Ok(())
+}
+
+/// Receive phone-initiated「快传 / 发送到电脑」batches: the phone announces
+/// `FILE_TRANS_TAG:[...]` on the control WS, we pull the files over the mdfs
+/// download plane and ack on the same WS. Batches are handled one at a time
+/// (inline), so a transfer already in progress naturally queues later ones.
+async fn cmd_recv(args: Args) -> Result<()> {
+    use pcsuite_core::filetrans;
+    use tokio::sync::broadcast::error::RecvError;
+
+    let identity = config::default_identity();
+    let out_dir = args.out.clone().unwrap_or_else(|| {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let dl = format!("{home}/Downloads");
+        if !home.is_empty() && std::path::Path::new(&dl).is_dir() {
+            dl
+        } else {
+            ".".to_string()
+        }
+    });
+    std::fs::create_dir_all(&out_dir).with_context(|| format!("mkdir {out_dir}"))?;
+
+    let t = resolve_transport(&args, "recv").await?;
+    let session = Session::connect(&t.data_ip, &t.token).await?;
+    let phone = session.phone_info(&t.pc_ip, &t.connect_type, &identity).await?;
+    tracing::info!(device = %phone.mobile_device_id, name = %phone.mobile_device_name, "recv session resolved");
+
+    println!("📥 等待手机「快传/发送到电脑」…  保存到 {out_dir}   Ctrl-C 退出");
+    let mut rx = session.control().subscribe();
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => break,
+            msg = rx.recv() => match msg {
+                Err(RecvError::Closed) => break,
+                Err(RecvError::Lagged(n)) => {
+                    tracing::warn!(skipped = n, "control messages lagged");
+                }
+                Ok(text) => {
+                    if filetrans::is_cancel(&text) {
+                        println!("⚠ 手机取消了当前传输");
+                        continue;
+                    }
+                    let Some(batch) = filetrans::parse_file_trans_tag(&text) else {
+                        continue;
+                    };
+                    if batch.is_empty() {
+                        continue;
+                    }
+                    println!("📥 收到 {} 个文件:", batch.len());
+                    for it in &batch {
+                        println!("   {:>9}  {}", human_size(it.size), it.file_name);
+                    }
+                    let ok = recv_batch(&t.data_ip, &t.token, &phone.mobile_device_id, &batch, &out_dir).await;
+                    let receipt = match ok {
+                        Ok(n) => filetrans::success_receipt(batch.len() as u32, n),
+                        Err(e) => {
+                            println!("✗ 接收失败: {e:#}");
+                            filetrans::fail_receipt(batch.len() as u32)
+                        }
+                    };
+                    if let Err(e) = session.control().send(receipt).await {
+                        tracing::warn!(err = %e, "receipt send failed");
+                    }
+                    if !rx.is_empty() {
+                        println!("· 还有排队的控制消息，继续处理");
+                    }
+                }
+            },
+        }
+    }
+
+    drop(session);
+    cleanup_transport(&t, false).await;
+    Ok(())
+}
+
+/// Receive vivo 互传 (EasyShare) batches: standalone 10191 listener, no session
+/// needed — the phone discovers this Mac via the SSDP presence and connects to
+/// *us*. Events arrive as FileTransEvent (started/done/failed).
+async fn cmd_share_recv(args: Args) -> Result<()> {
+    let out_dir = args.out.clone().unwrap_or_else(|| {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let dl = format!("{home}/Downloads");
+        if !home.is_empty() && std::path::Path::new(&dl).is_dir() {
+            dl
+        } else {
+            ".".to_string()
+        }
+    });
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let cfg = pcsuite_core::ShareConfig {
+        save_dir: out_dir.clone(),
+    };
+    let _recv = pcsuite_core::ShareReceiver::start(cfg, move |ev| {
+        let _ = tx.send(ev.to_json());
+    })
+    .await
+    .context("互传 receiver 启动失败")?;
+    println!("📥 互传接收就绪 :10191 — 手机上点「互传→我的设备→本机」发送。保存到 {out_dir}   Ctrl-C 退出");
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => break,
+            msg = rx.recv() => match msg {
+                None => break,
+                Some(json) => println!("📥 {json}"),
+            },
+        }
+    }
+    Ok(())
+}
+
+/// Pull one announced batch over mdfs and write every tar entry into `out_dir`.
+/// Returns the number of files written.
+async fn recv_batch(
+    data_ip: &str,
+    token: &str,
+    device_id: &str,
+    batch: &[pcsuite_core::filetrans::FileTransItem],
+    out_dir: &str,
+) -> Result<u32> {
+    let paths: Vec<String> = batch.iter().map(|it| it.path.clone()).collect();
+    let total: u64 = batch.iter().map(|it| it.size).sum();
+    let files = mdfs::download_batch(data_ip, token, device_id, &paths, total).await?;
+    let mut written = 0u32;
+    for (name, bytes) in &files {
+        // Tar entry names come from the phone — keep only the basename.
+        let safe = std::path::Path::new(name)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| format!("recv-{written}.bin"));
+        let dest = format!("{out_dir}/{safe}");
+        std::fs::write(&dest, bytes).with_context(|| format!("write {dest}"))?;
+        println!("   ✅ {safe} ({} bytes) → {dest}", bytes.len());
+        written += 1;
+    }
+    println!("✅ 本批完成: {written}/{} 个文件", batch.len());
+    Ok(written)
 }
 
 /// Human-readable byte count.
