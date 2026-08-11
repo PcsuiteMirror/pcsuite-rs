@@ -62,6 +62,10 @@ struct Args {
     /// `cloud login` credentials (from the app's QR login, or a captured session).
     open_id: Option<String>,
     token: Option<String>,
+    /// `cloud register` probe: publish this push clientId instead of the stored one.
+    push_client_id: Option<String>,
+    /// `cloud events` probe: fetch one event by id (omit to try enumerating).
+    event_id: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -91,6 +95,8 @@ fn parse_args() -> Args {
         sub: None,
         open_id: None,
         token: None,
+        push_client_id: None,
+        event_id: None,
     };
     let mut i = 1;
     while i < raw.len() {
@@ -149,6 +155,14 @@ fn parse_args() -> Args {
                 i += 1;
                 a.token = raw.get(i).cloned();
             }
+            "--push-client-id" => {
+                i += 1;
+                a.push_client_id = raw.get(i).cloned();
+            }
+            "--event-id" => {
+                i += 1;
+                a.event_id = raw.get(i).cloned();
+            }
             _ => {
                 // Positional args (push 的本地文件列表 / cloud 的子命令)；未知 --flag 照旧忽略。
                 if !flag.starts_with("--") {
@@ -183,7 +197,7 @@ fn print_help() {
          pcsuite share-recv [--out <本地目录>]   (互传/EasyShare 接收：独立 10191 监听，无需连接会话)\n  \
          pcsuite all (--usb | --phone <IP> [--remote]) [--screen|--clipboard|--verify|--notify] \
          [--seconds <N>] [--out <f>]\n  \
-         pcsuite cloud status|register|devices|logout   (vivo 账号模式：把本机注册到连接中心)\n  \
+         pcsuite cloud status|register|devices|events|logout   (vivo 账号模式：把本机注册到连接中心)\n  \
          pcsuite cloud login --open-id <ID> --token <TOKEN>   (凭据来自 app 的扫码登录)\n\
          \x20                                       (clipboard+verify+notify in the background; type\n\
          \x20                                        `screen on`/`screen off` at the prompt to\n\
@@ -1103,10 +1117,28 @@ async fn cmd_cloud(args: Args) -> Result<()> {
             Ok(())
         }
         "register" => {
-            let acc = require_account()?;
-            let device_id = cloud::register_this_pc(acc).await?;
-            println!("✅ 已把本机注册到连接中心, deviceId={device_id}");
+            let cc = cloud::ConnectCenter::new(require_account()?)?;
+            cc.register_self_with(args.push_client_id.as_deref()).await?;
+            println!("✅ 已把本机注册到连接中心, deviceId={}", cc.device_id());
+            if let Some(id) = &args.push_client_id {
+                println!("   pushInfo.clientId = {id}");
+            }
             println!("   手机端「连接中心」里现在应该能看到这台电脑。");
+            Ok(())
+        }
+        "raw" => {
+            let cc = cloud::ConnectCenter::new(require_account()?)?;
+            let path = args.path.clone().unwrap_or_else(|| "/device/list".into());
+            let v = cc.raw(if args.remote { "GET" } else { "POST" }, &path).await?;
+            println!("{}", serde_json::to_string_pretty(&v)?);
+            Ok(())
+        }
+        "events" => {
+            // Probe: can a client without a push channel pull the connect
+            // request the phone created, instead of being pushed its id?
+            let cc = cloud::ConnectCenter::new(require_account()?)?;
+            let v = cc.events(args.event_id.as_deref()).await?;
+            println!("{}", serde_json::to_string_pretty(&v)?);
             Ok(())
         }
         "devices" => {
@@ -1131,7 +1163,9 @@ async fn cmd_cloud(args: Args) -> Result<()> {
             Ok(())
         }
         other => {
-            anyhow::bail!("unknown cloud subcommand: {other} (status|login|register|devices|logout)")
+            anyhow::bail!(
+                "unknown cloud subcommand: {other} (status|login|register|devices|events|logout)"
+            )
         }
     }
 }

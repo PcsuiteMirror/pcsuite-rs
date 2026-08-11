@@ -87,6 +87,8 @@ void* __swift_bridge__$pcsuite_usb_probe(void);
 struct __private__ResultPtrAndPtr __swift_bridge__$pcsuite_connect_lan(void* phone_ip, bool remote);
 void __swift_bridge__$pcsuite_cancel_connect(void);
 void* __swift_bridge__$pcsuite_pair_begin(void* lip);
+void* __swift_bridge__$pcsuite_presence_start(void);
+void __swift_bridge__$pcsuite_presence_stop(void);
 void __swift_bridge__$pcsuite_set_mode(void* mode);
 void* __swift_bridge__$pcsuite_mode(void);
 void __swift_bridge__$pcsuite_cloud_set_account(void* open_id, void* token, void* country_code);

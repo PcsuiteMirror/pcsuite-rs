@@ -135,10 +135,9 @@ pub async fn register(cfg: RegisterConfig) -> Result<Registration> {
             extra: "null",
         };
         let b64 = STANDARD.encode(serde_json::to_vec(&pres)?);
-        let announce = ssdp::build_announce(&b64);
         let handle = PresenceGuard(Some(tokio::spawn(ssdp::presence_loop(
             cfg.reg_ip.clone(),
-            announce,
+            b64,
             Duration::from_secs(2),
         ))));
         // give the phone a moment to register us as an active nearby peer

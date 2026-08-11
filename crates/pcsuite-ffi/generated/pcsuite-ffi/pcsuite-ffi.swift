@@ -28,6 +28,12 @@ public func pcsuite_cancel_connect() {
 public func pcsuite_pair_begin<GenericIntoRustString: IntoRustString>(_ lip: GenericIntoRustString) -> PcPairing {
     PcPairing(ptr: __swift_bridge__$pcsuite_pair_begin({ let rustString = lip.intoRustString(); rustString.isOwned = false; return rustString.ptr }()))
 }
+public func pcsuite_presence_start() throws -> () {
+    try { let val = __swift_bridge__$pcsuite_presence_start(); if val != nil { throw RustString(ptr: val!) } else { return } }()
+}
+public func pcsuite_presence_stop() {
+    __swift_bridge__$pcsuite_presence_stop()
+}
 public func pcsuite_set_mode<GenericIntoRustString: IntoRustString>(_ mode: GenericIntoRustString) {
     __swift_bridge__$pcsuite_set_mode({ let rustString = mode.intoRustString(); rustString.isOwned = false; return rustString.ptr }())
 }

@@ -221,6 +221,13 @@ mod ffi {
         // Render qr_url() as a QR for the phone to scan via PCSuite 扫码连接电脑.
         fn pcsuite_pair_begin(lip: String) -> PcPairing;
 
+        // Start/stop the LAN presence beacon: without it the phone's "find a
+        // computer" search reports not-found, because it discovers PCs by
+        // listening for this. Purely local — fine in either mode. Call after the
+        // identity is set; calling start twice restarts with the current identity.
+        fn pcsuite_presence_start() -> Result<(), String>;
+        fn pcsuite_presence_stop();
+
         // ── vivo-account mode (opt-in; serverless never calls any of these) ──
         //
         // Select the identity mode: "serverless" (default — no server is ever
@@ -972,6 +979,22 @@ fn pcsuite_set_seed(phone_ip: String, seed: String) {
 
 fn pcsuite_set_clip_id(clip_id: String) {
     config::set_clip_pc_id(clip_id);
+}
+
+fn presence_slot() -> &'static std::sync::Mutex<Option<pcsuite_core::PresenceBeacon>> {
+    static P: OnceLock<std::sync::Mutex<Option<pcsuite_core::PresenceBeacon>>> = OnceLock::new();
+    P.get_or_init(Default::default)
+}
+
+fn pcsuite_presence_start() -> Result<(), String> {
+    let _guard = rt().enter(); // presence::start spawns onto the shared runtime
+    let beacon = pcsuite_core::presence::start().map_err(|e| format!("{e:#}"))?;
+    *presence_slot().lock().unwrap() = Some(beacon); // dropping any previous one stops it
+    Ok(())
+}
+
+fn pcsuite_presence_stop() {
+    presence_slot().lock().unwrap().take();
 }
 
 // ───────────────────── vivo-account mode (opt-in) ─────────────────────

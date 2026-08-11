@@ -159,6 +159,9 @@ pub struct CloudDevice {
     pub device_type: i64,
     /// LAN addresses the device last reported — a connect target for LAN mode.
     pub inets: Vec<String>,
+    /// `pushInfo.clientId`: the device's MQTT push registration. Empty means the
+    /// cloud has no way to reach it, which the phone shows as "not discovered".
+    pub push_client_id: String,
     /// When the device last reported itself, e.g. `2026-08-11 10:59:09.374`. The
     /// API has no online flag, so freshness of this is the only liveness signal.
     pub report_time: String,
@@ -316,20 +319,55 @@ impl ConnectCenter {
     ///
     /// `inets` are this Mac's LAN addresses — the phone uses them to reach us,
     /// so an empty list registers a PC that cannot be connected to.
-    pub async fn report_device(&self, name: &str, pc_mac: &str, inets: &[String]) -> Result<()> {
-        let body = json!([self.device_payload(name, pc_mac, inets)]);
+    ///
+    /// `push_client_id` is the MQTT push registration to publish. **A report
+    /// replaces the whole record**, so passing `None` when the cloud already
+    /// holds one wipes it, and the phone then shows this PC as "not discovered".
+    /// Use [`Self::register_self`], which carries the existing value over.
+    pub async fn report_device(
+        &self,
+        name: &str,
+        pc_mac: &str,
+        inets: &[String],
+        push_client_id: Option<&str>,
+    ) -> Result<()> {
+        let body = json!([self.device_payload(name, pc_mac, inets, push_client_id)]);
         self.call("POST", "/device/report", Some(body)).await?;
-        tracing::info!(device_id = %self.device_id, "registered PC with the connection center");
+        tracing::info!(
+            device_id = %self.device_id,
+            push_client_id = push_client_id.unwrap_or("<none>"),
+            "registered PC with the connection center"
+        );
         Ok(())
     }
 
+    /// The push client id the cloud currently holds for this PC, if any.
+    async fn existing_push_client_id(&self) -> Option<String> {
+        let list = self.device_list().await.ok()?;
+        list.into_iter()
+            .find(|d| d.device_id == self.device_id)
+            .map(|d| d.push_client_id)
+            .filter(|s| !s.is_empty())
+    }
+
     /// The device object `/device/report` expects, shaped like the official one.
-    fn device_payload(&self, name: &str, pc_mac: &str, inets: &[String]) -> Value {
+    fn device_payload(
+        &self,
+        name: &str,
+        pc_mac: &str,
+        inets: &[String],
+        push_client_id: Option<&str>,
+    ) -> Value {
         let inets: Vec<Value> = inets
             .iter()
             .map(|ip| json!({ "inet": ip, "localInet": ip, "netmark": "255.255.255.0", "ssid": "" }))
             .collect();
-        json!({
+        let mut ext = json!({
+            "deviceType": "Mac",
+            "businessId": pc_mac,
+            "pc_pcsuite_version": CLIENT_VERSION,
+        });
+        let mut device = json!({
             "userId": self.account.open_id,
             "deviceId": self.device_id,
             "name": name,
@@ -338,15 +376,18 @@ impl ConnectCenter {
             "type": DEVICE_TYPE_PC,
             "inets": inets,
             "bizInfo": { "office_suite": { "businessId": pc_mac } },
-            "ext": {
-                "deviceType": "Mac",
-                "businessId": pc_mac,
-                "pc_pcsuite_version": CLIENT_VERSION,
-            },
             "bluetooth": pc_mac,
             "wifiSwitch": 1,
             "btSwitch": 0,
-        })
+        });
+        // The official client puts the push client id in both places; mirror that
+        // exactly, and omit both when there is none rather than sending a null.
+        if let Some(cid) = push_client_id.filter(|s| !s.is_empty()) {
+            ext["clientId"] = json!(cid);
+            device["pushInfo"] = json!({ "clientId": cid });
+        }
+        device["ext"] = ext;
+        device
     }
 
     /// Every device bound to this account, phones included.
@@ -367,12 +408,57 @@ impl ConnectCenter {
     /// (device name / PC MAC from [`config::default_identity`]) plus the detected
     /// LAN addresses. The one call a frontend needs after a successful login.
     pub async fn register_self(&self) -> Result<()> {
+        self.register_self_with(None).await
+    }
+
+    /// As [`Self::register_self`], but publishing `push_client_id` instead of
+    /// whatever the cloud already holds. Only for a caller that owns a real push
+    /// registration — publishing an id nothing is listening on makes the cloud
+    /// push into a void.
+    pub async fn register_self_with(&self, push_client_id: Option<&str>) -> Result<()> {
         let id = config::default_identity();
         let inets = local_ipv4s();
         if inets.is_empty() {
             tracing::warn!("no LAN address detected; the phone will not be able to reach this PC");
         }
-        self.report_device(&id.device_name, &id.pc_mac, &inets).await
+        // Carry over whatever push registration this PC already has unless the
+        // caller supplied one. We have no MQTT client of our own yet, and a
+        // report with no `pushInfo` *clears* the stored one — which would also
+        // break the official client's wake-up.
+        let push_client_id = match push_client_id {
+            Some(id) => Some(id.to_string()),
+            None => self.existing_push_client_id().await,
+        };
+        if push_client_id.is_none() {
+            tracing::warn!(
+                "no push client id registered for this PC — the phone will list it as undiscovered \
+                 until a push client registers one (see docs/VIVO_ACCOUNT_LOGIN.md §5)"
+            );
+        }
+        self.report_device(&id.device_name, &id.pc_mac, &inets, push_client_id.as_deref())
+            .await
+    }
+
+    /// Fetch connection-center events. The phone's "connect" tap creates one
+    /// (`handleType: CREATE_EVENT`) and the cloud normally *pushes* its id over
+    /// MQTT; this asks for it over HTTP instead, which is what a client without
+    /// a push channel would need. Pass `None` to try enumerating pending events.
+    ///
+    /// Returns the raw envelope — the response shape is not yet known.
+    pub async fn events(&self, event_id: Option<&str>) -> Result<Value> {
+        // The official client appends `?eventId=` / `?deviceId=` to the path —
+        // POST with a query string, not a JSON body (a body yields code 20000).
+        let path = match event_id {
+            Some(id) => format!("/event/get?eventId={id}"),
+            None => format!("/event/get?deviceId={}", self.device_id),
+        };
+        self.call("POST", &path, None).await
+    }
+
+    /// Issue an arbitrary connection-center call. For probing endpoints whose
+    /// shape isn't known yet; returns the raw envelope.
+    pub async fn raw(&self, method: &str, path: &str) -> Result<Value> {
+        self.call(method, path, None).await
     }
 
     /// Acknowledge a connection-center event (the phone's "connect" tap creates
@@ -405,6 +491,12 @@ fn parse_device_list(v: &Value) -> Vec<CloudDevice> {
                 device_type: d.get("type").and_then(Value::as_i64).unwrap_or(0),
                 inets: parse_inets(d.get("inets")),
                 report_time: s("reportTime"),
+                push_client_id: d
+                    .get("pushInfo")
+                    .and_then(|p| p.get("clientId"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
                 seeds: parse_seeds(d.get("ext")),
             }
         })
@@ -540,13 +632,55 @@ mod tests {
             device_id: "dev".into(),
             host: CONNECT_CENTER_HOST.into(),
         };
-        let p = cc.device_payload("My Mac", "aabbccddeeff", &["192.0.2.10".into()]);
+        let p = cc.device_payload("My Mac", "aabbccddeeff", &["192.0.2.10".into()], None);
         assert_eq!(p["type"], 3);
         assert_eq!(p["userId"], "oid");
         assert_eq!(p["inets"][0]["inet"], "192.0.2.10");
         assert_eq!(p["inets"][0]["localInet"], "192.0.2.10");
         assert_eq!(p["bizInfo"]["office_suite"]["businessId"], "aabbccddeeff");
         assert_eq!(p["ext"]["deviceType"], "Mac");
+    }
+
+    #[test]
+    fn a_push_client_id_lands_in_both_places_the_official_client_uses() {
+        let cc = ConnectCenter {
+            account: Account::new("oid", "tok.1"),
+            device_id: "dev".into(),
+            host: CONNECT_CENTER_HOST.into(),
+        };
+        let p = cc.device_payload("My Mac", "aabbccddeeff", &[], Some("1234567890"));
+        assert_eq!(p["pushInfo"]["clientId"], "1234567890");
+        assert_eq!(p["ext"]["clientId"], "1234567890");
+    }
+
+    #[test]
+    fn no_push_client_id_omits_the_keys_rather_than_nulling_them() {
+        // Regression: a report replaces the whole record, so emitting
+        // `pushInfo: null` wipes the id a push client had registered — the cloud
+        // then has no way to reach this PC and the phone shows it as "not
+        // discovered". Absent keys must stay absent.
+        let cc = ConnectCenter {
+            account: Account::new("oid", "tok.1"),
+            device_id: "dev".into(),
+            host: CONNECT_CENTER_HOST.into(),
+        };
+        for empty in [None, Some("")] {
+            let p = cc.device_payload("My Mac", "aabbccddeeff", &[], empty);
+            assert!(p.get("pushInfo").is_none(), "pushInfo must be absent, not null");
+            assert!(p["ext"].get("clientId").is_none());
+        }
+    }
+
+    #[test]
+    fn push_client_id_is_read_back_from_a_device_list() {
+        let v = serde_json::json!({
+            "code": 0,
+            "data": [{ "deviceId": "dev", "type": 3, "pushInfo": { "clientId": "1234567890" } },
+                     { "deviceId": "other", "type": 3, "pushInfo": null }]
+        });
+        let list = parse_device_list(&v);
+        assert_eq!(list[0].push_client_id, "1234567890");
+        assert_eq!(list[1].push_client_id, "");
     }
 
     /// A `/device/list` reply with the **shape** of a real one (captured
