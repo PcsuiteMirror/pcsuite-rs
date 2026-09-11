@@ -26,8 +26,9 @@ use std::sync::OnceLock;
 use tokio::runtime::Runtime;
 
 use pcsuite_core::{
-    cloud, config, pair, register, usb, ClipboardConfig, InputHandle, MouseAction, MouseButton,
-    PhoneNotify, RegisterConfig, Registration, ScreenParams, ScreenStream, Session, UsbConfig,
+    cloud, config, pair, register, usb, ClipboardConfig, DeadReason, InputHandle, MouseAction,
+    MouseButton, PhoneNotify, RegisterConfig, Registration, ScreenParams, ScreenStream, Session,
+    UsbConfig,
 };
 
 mod clipboard_mac;
@@ -150,11 +151,13 @@ mod ffi {
         // Blocking (one HTTP round-trip) — call off the main thread.
         fn device_info(&self) -> Result<String, String>;
 
-        // Block until the connection is lost (the shared 10380 control WS — used by
-        // both USB and LAN — closed or errored), returning a short reason string.
-        // Returns "" if stop_watch() was called first (intentional teardown). Loop
-        // this on a background thread: a non-empty return means the link dropped, so
-        // the app can tear down and reconnect. Covers idle and mid-mirror drops alike.
+        // Block until the connection is gone (the shared 10380 control WS — used by
+        // both USB and LAN — closed or errored), returning why: "closed by phone"
+        // when the phone ended the session on purpose (WS close frame / "close"
+        // text — the user chose that, don't dial back), "connection lost" when the
+        // link dropped (worth reconnecting). Returns "" if stop_watch() was called
+        // first (intentional teardown). Run on a background thread; covers idle and
+        // mid-mirror drops alike.
         fn wait_disconnect(&self) -> String;
         // Ask wait_disconnect() to return "" within ~300ms so its watcher thread can
         // break and release this PcSession before the handle is dropped.
@@ -378,8 +381,8 @@ pub struct PcSession {
     // own SHADOW startup (it would rotate the clipboard keys mid-handshake and break
     // phone→PC sync) — it waits for the clipboard handshake's retained reply instead.
     clipboard_active: std::sync::atomic::AtomicBool,
-    // Liveness of the shared control WS; reads `true` once the connection is lost.
-    dead_rx: tokio::sync::Mutex<tokio::sync::watch::Receiver<bool>>,
+    // Liveness of the shared control WS; reads `Some(why)` once the connection is gone.
+    dead_rx: tokio::sync::Mutex<tokio::sync::watch::Receiver<Option<DeadReason>>>,
     // Set by stop_watch(); the disconnect watcher checks it between short timeouts.
     watch_stop: std::sync::atomic::AtomicBool,
     token: String,
@@ -849,26 +852,33 @@ impl PcSession {
     fn wait_disconnect(&self) -> String {
         use std::sync::atomic::Ordering;
         use std::time::Duration;
+        fn describe(reason: DeadReason) -> String {
+            match reason {
+                DeadReason::Closed => "closed by phone",
+                DeadReason::Lost => "connection lost",
+            }
+            .to_string()
+        }
         rt().block_on(async {
             let mut rx = self.dead_rx.lock().await;
             loop {
                 if self.watch_stop.load(Ordering::Relaxed) {
                     return String::new(); // intentional teardown
                 }
-                if *rx.borrow() {
-                    return "connection lost".to_string();
+                if let Some(reason) = *rx.borrow() {
+                    return describe(reason);
                 }
                 // Short timeout so stop_watch() is noticed promptly even while the
                 // connection is still healthy and the signal hasn't changed.
                 match tokio::time::timeout(Duration::from_millis(300), rx.changed()).await {
                     Ok(Ok(())) => {
-                        if *rx.borrow() {
-                            return "connection lost".to_string();
+                        if let Some(reason) = *rx.borrow() {
+                            return describe(reason);
                         }
                     }
-                    // Sender dropped without flipping the flag — the session was
-                    // dropped out from under us; treat as a (benign) disconnect.
-                    Ok(Err(_)) => return "connection lost".to_string(),
+                    // Sender dropped without setting a reason — the session was
+                    // dropped out from under us; treat as a (benign) link loss.
+                    Ok(Err(_)) => return describe(DeadReason::Lost),
                     Err(_) => continue, // timeout -> re-check the stop flag
                 }
             }

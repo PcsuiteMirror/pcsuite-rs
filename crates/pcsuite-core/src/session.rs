@@ -61,13 +61,26 @@ pub struct Session {
     data_ip: String,
     token: String,
     tasks: Vec<JoinHandle<()>>,
-    /// Flips to `true` when the control WS owner task exits (peer closed, read/write
-    /// error, or keepalive send failure) — i.e. the connection is gone. This is the
-    /// single, transport-agnostic liveness signal (USB and LAN both ride the one
-    /// 10380 control WS), surfaced to the app so it can reconnect. Retains its value
-    /// for late subscribers; an aborted task (intentional teardown) drops the sender
-    /// instead, which the FFI distinguishes via its own stop flag.
-    dead_rx: watch::Receiver<bool>,
+    /// Set once the control WS owner task exits — i.e. the connection is gone —
+    /// saying how (see [`DeadReason`]). This is the single, transport-agnostic
+    /// liveness signal (USB and LAN both ride the one 10380 control WS), surfaced
+    /// to the app so it can decide whether to reconnect. Retains its value for late
+    /// subscribers; an aborted task (intentional teardown) drops the sender instead,
+    /// which the FFI distinguishes via its own stop flag.
+    dead_rx: watch::Receiver<Option<DeadReason>>,
+}
+
+/// How a session ended. The app treats the two very differently: a link that
+/// dropped is worth reconnecting to, a session the phone ended is not — the user
+/// chose that on the phone, and dialling straight back in would undo it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeadReason {
+    /// The phone ended it on purpose: it sent a WebSocket close frame, or the
+    /// literal `"close"` text the official apps use for a graceful disconnect.
+    Closed,
+    /// The link went away under us: cable out, Wi-Fi gone, phone died, keepalive
+    /// send failed.
+    Lost,
 }
 
 impl Drop for Session {
@@ -94,7 +107,7 @@ impl Session {
             in_tx: in_tx.clone(),
             last_shadow: last_shadow.clone(),
         };
-        let (dead_tx, dead_rx) = watch::channel(false);
+        let (dead_tx, dead_rx) = watch::channel(None);
         let task = tokio::spawn(control_task(ws, out_rx, in_tx, last_shadow, dead_tx));
         Ok(Session {
             control,
@@ -139,10 +152,10 @@ impl Session {
             .filter(|id| !id.is_empty())
     }
 
-    /// A receiver for the session-death signal: it reads `true` once the control
-    /// WS owner task has exited (connection lost). The app polls this to drive
-    /// reconnection. Cloned so each consumer awaits independently.
-    pub fn dead_signal(&self) -> watch::Receiver<bool> {
+    /// A receiver for the session-death signal: it reads `Some(reason)` once the
+    /// control WS owner task has exited (connection gone). The app polls this to
+    /// drive reconnection. Cloned so each consumer awaits independently.
+    pub fn dead_signal(&self) -> watch::Receiver<Option<DeadReason>> {
         self.dead_rx.clone()
     }
 
@@ -414,21 +427,30 @@ impl ScreenStream {
 }
 
 /// The control-WS owner: read+broadcast incoming, drain+send outgoing, keepalive.
-/// Every exit path means the connection is gone, so it flips `dead_tx` on the way
-/// out — the one liveness signal the app watches to reconnect. (If the task is
-/// aborted during an intentional teardown the send never runs and `dead_tx` simply
-/// drops, which the FFI watcher ignores via its own stop flag.)
+/// Every exit path means the connection is gone, so it sets `dead_tx` on the way
+/// out — the one liveness signal the app watches to decide about reconnecting —
+/// saying whether the phone ended it or the link dropped. (If the task is aborted
+/// during an intentional teardown the send never runs and `dead_tx` simply drops,
+/// which the FFI watcher ignores via its own stop flag.)
 async fn control_task(
     mut ws: WsClient<Tls>,
     mut out_rx: mpsc::Receiver<String>,
     in_tx: broadcast::Sender<String>,
     last_shadow: Arc<Mutex<Option<String>>>,
-    dead_tx: watch::Sender<bool>,
+    dead_tx: watch::Sender<Option<DeadReason>>,
 ) {
     let mut last_ka = Instant::now();
-    'run: loop {
+    // The phone announces a deliberate disconnect the same way we do (see
+    // `shutdown_clipboard`): a `"close"` text, then the socket goes. Remember it
+    // so the exit that follows is attributed to the phone, not the network.
+    let mut peer_said_close = false;
+    let mut last_text = String::new();
+    let reason = 'run: loop {
         match timeout(Duration::from_millis(200), ws.recv()).await {
             Ok(Ok(WsFrame::Text(t))) => {
+                if t.trim().eq_ignore_ascii_case("close") {
+                    peer_said_close = true;
+                }
                 // Retain only genuine phone announcements (the ones carrying
                 // mobileDeviceInfo). Anything else that starts with the prefix —
                 // e.g. an echo of our own startup/ready — would overwrite the good
@@ -444,23 +466,24 @@ async fn control_task(
                 if t.contains("FILE") || t.contains("TRANS") {
                     tracing::info!("[control] file-related frame: {}", &t[..t.len().min(500)]);
                 }
+                last_text = t.chars().take(120).collect();
                 let _ = in_tx.send(t);
             }
             Ok(Ok(WsFrame::Ping(p))) => {
                 if ws.send_pong(&p).await.is_err() {
-                    break 'run;
+                    break 'run DeadReason::Lost;
                 }
             }
-            Ok(Ok(WsFrame::Close)) => break 'run,
+            Ok(Ok(WsFrame::Close)) => break 'run DeadReason::Closed,
             Ok(Ok(_)) => {}
-            Ok(Err(_)) => break 'run,
+            Ok(Err(_)) => break 'run DeadReason::Lost,
             Err(_) => {} // recv timeout -> flush outgoing + keepalive
         }
         loop {
             match out_rx.try_recv() {
                 Ok(msg) => {
                     if ws.send_text(&msg).await.is_err() {
-                        break 'run;
+                        break 'run DeadReason::Lost;
                     }
                 }
                 Err(_) => break,
@@ -468,11 +491,15 @@ async fn control_task(
         }
         if last_ka.elapsed() >= Duration::from_secs(3) {
             if ws.send_text(screenmsg::KEEPALIVE).await.is_err() {
-                break 'run;
+                break 'run DeadReason::Lost;
             }
             last_ka = Instant::now();
         }
-    }
-    // Control WS is gone — report the disconnect to whoever is watching.
-    let _ = dead_tx.send(true);
+    };
+    let reason = if peer_said_close { DeadReason::Closed } else { reason };
+    // Control WS is gone — report the disconnect to whoever is watching. The
+    // last frame is logged so a phone-side disconnect we don't recognise yet can
+    // be identified from the log rather than a capture.
+    tracing::info!(?reason, last_frame = %last_text, "[control] WS ended");
+    let _ = dead_tx.send(Some(reason));
 }
