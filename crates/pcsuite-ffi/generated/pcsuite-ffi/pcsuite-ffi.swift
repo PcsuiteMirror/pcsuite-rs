@@ -58,6 +58,9 @@ public func pcsuite_cloud_devices() throws -> RustString {
 public func pcsuite_cloud_unregister() throws -> RustString {
     try { let val = __swift_bridge__$pcsuite_cloud_unregister(); if val.is_ok { return RustString(ptr: val.ok_or_err!) } else { throw RustString(ptr: val.ok_or_err!) } }()
 }
+public func pcsuite_cloud_presence_start<GenericIntoRustString: IntoRustString>(_ phone_ip: GenericIntoRustString, _ remote: Bool) -> PcCloudPresence {
+    PcCloudPresence(ptr: __swift_bridge__$pcsuite_cloud_presence_start({ let rustString = phone_ip.intoRustString(); rustString.isOwned = false; return rustString.ptr }(), remote))
+}
 
 public class PcScreen: PcScreenRefMut {
     var isOwned: Bool = true
@@ -319,6 +322,90 @@ extension PcSession: Vectorizable {
 
     public static func vecOfSelfLen(vecPtr: UnsafeMutableRawPointer) -> UInt {
         __swift_bridge__$Vec_PcSession$len(vecPtr)
+    }
+}
+
+
+public class PcCloudPresence: PcCloudPresenceRefMut {
+    var isOwned: Bool = true
+
+    public override init(ptr: UnsafeMutableRawPointer) {
+        super.init(ptr: ptr)
+    }
+
+    deinit {
+        if isOwned {
+            __swift_bridge__$PcCloudPresence$_free(ptr)
+        }
+    }
+}
+public class PcCloudPresenceRefMut: PcCloudPresenceRef {
+    public override init(ptr: UnsafeMutableRawPointer) {
+        super.init(ptr: ptr)
+    }
+}
+public class PcCloudPresenceRef {
+    var ptr: UnsafeMutableRawPointer
+
+    public init(ptr: UnsafeMutableRawPointer) {
+        self.ptr = ptr
+    }
+}
+extension PcCloudPresenceRef {
+    public func status() -> RustString {
+        RustString(ptr: __swift_bridge__$PcCloudPresence$status(ptr))
+    }
+
+    public func stop() {
+        __swift_bridge__$PcCloudPresence$stop(ptr)
+    }
+}
+extension PcCloudPresence: Vectorizable {
+    public static func vecOfSelfNew() -> UnsafeMutableRawPointer {
+        __swift_bridge__$Vec_PcCloudPresence$new()
+    }
+
+    public static func vecOfSelfFree(vecPtr: UnsafeMutableRawPointer) {
+        __swift_bridge__$Vec_PcCloudPresence$drop(vecPtr)
+    }
+
+    public static func vecOfSelfPush(vecPtr: UnsafeMutableRawPointer, value: PcCloudPresence) {
+        __swift_bridge__$Vec_PcCloudPresence$push(vecPtr, {value.isOwned = false; return value.ptr;}())
+    }
+
+    public static func vecOfSelfPop(vecPtr: UnsafeMutableRawPointer) -> Optional<Self> {
+        let pointer = __swift_bridge__$Vec_PcCloudPresence$pop(vecPtr)
+        if pointer == nil {
+            return nil
+        } else {
+            return (PcCloudPresence(ptr: pointer!) as! Self)
+        }
+    }
+
+    public static func vecOfSelfGet(vecPtr: UnsafeMutableRawPointer, index: UInt) -> Optional<PcCloudPresenceRef> {
+        let pointer = __swift_bridge__$Vec_PcCloudPresence$get(vecPtr, index)
+        if pointer == nil {
+            return nil
+        } else {
+            return PcCloudPresenceRef(ptr: pointer!)
+        }
+    }
+
+    public static func vecOfSelfGetMut(vecPtr: UnsafeMutableRawPointer, index: UInt) -> Optional<PcCloudPresenceRefMut> {
+        let pointer = __swift_bridge__$Vec_PcCloudPresence$get_mut(vecPtr, index)
+        if pointer == nil {
+            return nil
+        } else {
+            return PcCloudPresenceRefMut(ptr: pointer!)
+        }
+    }
+
+    public static func vecOfSelfAsPtr(vecPtr: UnsafeMutableRawPointer) -> UnsafePointer<PcCloudPresenceRef> {
+        UnsafePointer<PcCloudPresenceRef>(OpaquePointer(__swift_bridge__$Vec_PcCloudPresence$as_ptr(vecPtr)))
+    }
+
+    public static func vecOfSelfLen(vecPtr: UnsafeMutableRawPointer) -> UInt {
+        __swift_bridge__$Vec_PcCloudPresence$len(vecPtr)
     }
 }
 

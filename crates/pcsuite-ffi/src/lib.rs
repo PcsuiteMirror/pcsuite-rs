@@ -26,9 +26,9 @@ use std::sync::OnceLock;
 use tokio::runtime::Runtime;
 
 use pcsuite_core::{
-    cloud, config, pair, register, usb, ClipboardConfig, DeadReason, InputHandle, MouseAction,
-    MouseButton, PhoneNotify, RegisterConfig, Registration, ScreenParams, ScreenStream, Session,
-    UsbConfig,
+    cloud, config, pair, presence_once, register, usb, ClipboardConfig, DeadReason, InputHandle,
+    MouseAction, MouseButton, PhoneNotify, PresenceConfig, RegisterConfig, Registration,
+    ScreenParams, ScreenStream, Session, UsbConfig,
 };
 
 mod clipboard_mac;
@@ -260,6 +260,33 @@ mod ffi {
         fn pcsuite_cloud_devices() -> Result<String, String>;
         // Remove this PC from the account (the phone stops listing it).
         fn pcsuite_cloud_unregister() -> Result<String, String>;
+    }
+
+    extern "Rust" {
+        type PcCloudPresence;
+        // Hold a 10191 ConnectFlow connection to `phone_ip` open so the phone's
+        // connection center lists this PC as discoverable ("可连"), reconnecting
+        // automatically if it drops. This is the mechanism the official desktop
+        // service uses; vpush / the cloud getUserCookie heartbeat / SSDP are all
+        // unnecessary (each was disproven — see docs/LAN_DISCOVERY_HANDOFF.md).
+        //
+        // Prerequisites: a REAL businessId must be configured (via
+        // pcsuite_set_identity's pc_mac, or the persisted config from
+        // pcsuite_cloud_register) and it must match what this PC is registered
+        // under, or the phone accepts the connection but never links it to the
+        // listed device (stays 「未发现」). For connectType=2 set the per-IP seed
+        // (pcsuite_set_seed) first; remote=true uses connectType=1 (no seed).
+        //
+        // Non-blocking: spawns a background task on the shared runtime and returns
+        // at once. Poll status() for the UI; call stop() (or drop the handle) to
+        // end and let the phone fall back to 「未发现」.
+        fn pcsuite_cloud_presence_start(phone_ip: String, remote: bool) -> PcCloudPresence;
+        // Current state, for the UI to poll: "connecting", "holding" (the phone
+        // shows 「可连」), "reconnecting", "error: <why>", or "stopped".
+        fn status(&self) -> String;
+        // Stop holding the connection (idempotent). The task ends and status
+        // becomes "stopped"; the phone reverts to 「未发现」 on its next refresh.
+        fn stop(&self);
     }
 
     extern "Rust" {
@@ -1012,6 +1039,118 @@ fn pcsuite_presence_start() -> Result<(), String> {
 
 fn pcsuite_presence_stop() {
     presence_slot().lock().unwrap().take();
+}
+
+// ── 10191 hold-presence (makes the phone list this PC as 「可连」) ──
+
+pub struct PcCloudPresence {
+    status: std::sync::Arc<std::sync::Mutex<String>>,
+    stop_tx: tokio::sync::watch::Sender<bool>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl PcCloudPresence {
+    fn status(&self) -> String {
+        self.status.lock().unwrap().clone()
+    }
+    fn stop(&self) {
+        let _ = self.stop_tx.send(true);
+    }
+}
+
+impl Drop for PcCloudPresence {
+    fn drop(&mut self) {
+        let _ = self.stop_tx.send(true);
+        if let Some(t) = self.task.take() {
+            t.abort();
+        }
+    }
+}
+
+fn pcsuite_cloud_presence_start(phone_ip: String, remote: bool) -> PcCloudPresence {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    let status = Arc::new(Mutex::new("connecting".to_string()));
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+
+    let identity = config::default_identity();
+    // Guard the placeholder businessId here too — holding a connection under it
+    // just wastes effort (the phone can't link it to the device → 「未发现」).
+    if config::is_pc_mac_placeholder(&identity.pc_mac) {
+        *status.lock().unwrap() =
+            "error: no businessId (call pcsuite_set_identity / pcsuite_cloud_register first)".into();
+        return PcCloudPresence { status, stop_tx, task: None };
+    }
+    let st = status.clone();
+    let _guard = rt().enter();
+    let task = rt().spawn(async move {
+        let mut stop_rx = stop_rx;
+        // Resolve the connectType=2 seed: a configured per-IP seed wins; otherwise
+        // read the phone's published `ext.seeds` from the connection center (what
+        // the CLI does), so the app never has to plumb the seed through itself.
+        let stored_seed = if remote {
+            None
+        } else {
+            match config::default_stored_seed(&phone_ip) {
+                Some(s) => Some(s),
+                None => match cloud_center() {
+                    Ok(cc) => cc.device_list().await.ok().and_then(|list| {
+                        list.iter().find(|d| d.is_phone()).and_then(|d| {
+                            d.seeds
+                                .get(&phone_ip)
+                                .or_else(|| d.seeds.values().next())
+                                .cloned()
+                        })
+                    }),
+                    Err(_) => None,
+                },
+            }
+        };
+        let cfg = PresenceConfig {
+            phone_ip,
+            identity,
+            stored_seed,
+            remote,
+        };
+
+        let mut backoff = Duration::from_secs(1);
+        loop {
+            if *stop_rx.borrow() {
+                break;
+            }
+            *st.lock().unwrap() = "connecting".into();
+            let st_ready = st.clone();
+            let once = presence_once(&cfg, move || {
+                *st_ready.lock().unwrap() = "holding".into();
+            });
+            tokio::select! {
+                r = once => match r {
+                    Ok(()) => {
+                        *st.lock().unwrap() = "reconnecting".into();
+                        backoff = Duration::from_secs(1);
+                    }
+                    Err(e) => *st.lock().unwrap() = format!("error: {e:#}"),
+                },
+                _ = stop_rx.changed() => break,
+            }
+            if *stop_rx.borrow() {
+                break;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(backoff) => {}
+                _ = stop_rx.changed() => break,
+            }
+            backoff = (backoff * 2).min(Duration::from_secs(30));
+        }
+        *st.lock().unwrap() = "stopped".into();
+    });
+
+    PcCloudPresence {
+        status,
+        stop_tx,
+        task: Some(task),
+    }
 }
 
 // ───────────────────── vivo-account mode (opt-in) ─────────────────────

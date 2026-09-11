@@ -25,6 +25,18 @@ void* __swift_bridge__$Vec_PcSession$get_mut(void* vec_ptr, uintptr_t index);
 uintptr_t __swift_bridge__$Vec_PcSession$len(void* vec_ptr);
 void* __swift_bridge__$Vec_PcSession$as_ptr(void* vec_ptr);
 
+typedef struct PcCloudPresence PcCloudPresence;
+void __swift_bridge__$PcCloudPresence$_free(void* self);
+
+void* __swift_bridge__$Vec_PcCloudPresence$new(void);
+void __swift_bridge__$Vec_PcCloudPresence$drop(void* vec_ptr);
+void __swift_bridge__$Vec_PcCloudPresence$push(void* vec_ptr, void* item_ptr);
+void* __swift_bridge__$Vec_PcCloudPresence$pop(void* vec_ptr);
+void* __swift_bridge__$Vec_PcCloudPresence$get(void* vec_ptr, uintptr_t index);
+void* __swift_bridge__$Vec_PcCloudPresence$get_mut(void* vec_ptr, uintptr_t index);
+uintptr_t __swift_bridge__$Vec_PcCloudPresence$len(void* vec_ptr);
+void* __swift_bridge__$Vec_PcCloudPresence$as_ptr(void* vec_ptr);
+
 typedef struct PcPairing PcPairing;
 void __swift_bridge__$PcPairing$_free(void* self);
 
@@ -97,6 +109,9 @@ void* __swift_bridge__$pcsuite_cloud_clip_pc_id(void);
 struct __private__ResultPtrAndPtr __swift_bridge__$pcsuite_cloud_register(void);
 struct __private__ResultPtrAndPtr __swift_bridge__$pcsuite_cloud_devices(void);
 struct __private__ResultPtrAndPtr __swift_bridge__$pcsuite_cloud_unregister(void);
+void* __swift_bridge__$pcsuite_cloud_presence_start(void* phone_ip, bool remote);
+void* __swift_bridge__$PcCloudPresence$status(void* self);
+void __swift_bridge__$PcCloudPresence$stop(void* self);
 void* __swift_bridge__$PcPairing$qr_url(void* self);
 void* __swift_bridge__$PcPairing$lan_ip(void* self);
 struct __private__ResultPtrAndPtr __swift_bridge__$PcPairing$wait_phone(void* self, uint32_t timeout_ms);
