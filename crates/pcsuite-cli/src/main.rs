@@ -1236,17 +1236,56 @@ async fn cmd_cloud_presence(args: &Args) -> Result<()> {
         phone_ip, cfg.identity.pc_mac
     );
 
+    // When the phone taps 「连接」 it pushes bytes:[24] on the held connection; a
+    // worker then opens the 10380 control session (connect only, no mirror), which
+    // is what makes the phone show 「已连接」.
+    let (req_tx, mut req_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let conn_ip = phone_ip.clone();
+    let conn_remote = args.remote;
+    tokio::spawn(async move {
+        while req_rx.recv().await.is_some() {
+            println!("📲 手机请求连接 → 建立控制会话(不投屏)…");
+            // Use connectType=1 (no pre-shared seed) for the escalation — it needs
+            // only the account openId (already set) and works on any network.
+            let _ = conn_remote;
+            let reg = register(RegisterConfig {
+                reg_ip: conn_ip.clone(),
+                identity: config::default_identity(),
+                stored_seed: None,
+                remote: true,
+                token: None,
+                conn_id: None,
+                presence: false,
+            })
+            .await;
+            match reg {
+                Ok(r) => match Session::connect(&conn_ip, &r.token).await {
+                    Ok(_s) => println!("   ✅ 已连接 (10380 控制会话已建立)。投屏用 `pcsuite screen` 另起。"),
+                    Err(e) => println!("   控制会话建立失败: {e:#}"),
+                },
+                Err(e) => println!("   连接失败(10380 未开): {e:#}"),
+            }
+        }
+    });
+
     // Reconnect loop with backoff; Ctrl+C exits.
     let run = async {
         let mut backoff = Duration::from_secs(1);
         loop {
-            match presence_once(&cfg, || {
-                println!("   ✅ 握手被接受，正在保持连接 = 手机应显示「可连」(断/连 wifi 刷新)");
-            })
+            let req_tx = req_tx.clone();
+            match presence_once(
+                &cfg,
+                || {
+                    println!("   ✅ 握手被接受，正在保持连接 = 手机应显示「可连」(断/连 wifi 刷新)");
+                },
+                move || {
+                    let _ = req_tx.send(());
+                },
+            )
             .await
             {
                 Ok(()) => {
-                    println!("   连接被手机关闭，{}s 后重连…", 1);
+                    println!("   连接被手机关闭，1s 后重连…");
                     backoff = Duration::from_secs(1);
                 }
                 Err(e) => {

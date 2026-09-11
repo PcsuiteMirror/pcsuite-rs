@@ -284,6 +284,11 @@ mod ffi {
         // Current state, for the UI to poll: "connecting", "holding" (the phone
         // shows 「可连」), "reconnecting", "error: <why>", or "stopped".
         fn status(&self) -> String;
+        // Poll-and-clear: returns true once after the phone tapped 「连接」 (it
+        // pushed bytes:[24] on the held connection). The app should react by
+        // opening a session (pcsuite_connect_lan) — connect only, no mirror; that
+        // is what the official desktop does. Returns false when nothing is pending.
+        fn take_connect_request(&self) -> bool;
         // Stop holding the connection (idempotent). The task ends and status
         // becomes "stopped"; the phone reverts to 「未发现」 on its next refresh.
         fn stop(&self);
@@ -1045,6 +1050,7 @@ fn pcsuite_presence_stop() {
 
 pub struct PcCloudPresence {
     status: std::sync::Arc<std::sync::Mutex<String>>,
+    connect_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
     stop_tx: tokio::sync::watch::Sender<bool>,
     task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -1052,6 +1058,10 @@ pub struct PcCloudPresence {
 impl PcCloudPresence {
     fn status(&self) -> String {
         self.status.lock().unwrap().clone()
+    }
+    fn take_connect_request(&self) -> bool {
+        self.connect_requested
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
     }
     fn stop(&self) {
         let _ = self.stop_tx.send(true);
@@ -1072,6 +1082,7 @@ fn pcsuite_cloud_presence_start(phone_ip: String, remote: bool) -> PcCloudPresen
     use std::time::Duration;
 
     let status = Arc::new(Mutex::new("connecting".to_string()));
+    let connect_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
 
     // The LAN sign must carry the account's openId (the phone rejects a mismatch
@@ -1089,9 +1100,10 @@ fn pcsuite_cloud_presence_start(phone_ip: String, remote: bool) -> PcCloudPresen
     if config::is_pc_mac_placeholder(&identity.pc_mac) {
         *status.lock().unwrap() =
             "error: no businessId (call pcsuite_set_identity / pcsuite_cloud_register first)".into();
-        return PcCloudPresence { status, stop_tx, task: None };
+        return PcCloudPresence { status, connect_requested, stop_tx, task: None };
     }
     let st = status.clone();
+    let req_flag = connect_requested.clone();
     let _guard = rt().enter();
     let task = rt().spawn(async move {
         let mut stop_rx = stop_rx;
@@ -1130,9 +1142,16 @@ fn pcsuite_cloud_presence_start(phone_ip: String, remote: bool) -> PcCloudPresen
             }
             *st.lock().unwrap() = "connecting".into();
             let st_ready = st.clone();
-            let once = presence_once(&cfg, move || {
-                *st_ready.lock().unwrap() = "holding".into();
-            });
+            let req = req_flag.clone();
+            let once = presence_once(
+                &cfg,
+                move || {
+                    *st_ready.lock().unwrap() = "holding".into();
+                },
+                move || {
+                    req.store(true, std::sync::atomic::Ordering::SeqCst);
+                },
+            );
             tokio::select! {
                 r = once => match r {
                     Ok(()) => {
@@ -1157,6 +1176,7 @@ fn pcsuite_cloud_presence_start(phone_ip: String, remote: bool) -> PcCloudPresen
 
     PcCloudPresence {
         status,
+        connect_requested,
         stop_tx,
         task: Some(task),
     }

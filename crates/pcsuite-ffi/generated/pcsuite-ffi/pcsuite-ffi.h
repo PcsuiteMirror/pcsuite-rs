@@ -111,6 +111,7 @@ struct __private__ResultPtrAndPtr __swift_bridge__$pcsuite_cloud_devices(void);
 struct __private__ResultPtrAndPtr __swift_bridge__$pcsuite_cloud_unregister(void);
 void* __swift_bridge__$pcsuite_cloud_presence_start(void* phone_ip, bool remote);
 void* __swift_bridge__$PcCloudPresence$status(void* self);
+bool __swift_bridge__$PcCloudPresence$take_connect_request(void* self);
 void __swift_bridge__$PcCloudPresence$stop(void* self);
 void* __swift_bridge__$PcPairing$qr_url(void* self);
 void* __swift_bridge__$PcPairing$lan_ip(void* self);

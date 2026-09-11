@@ -116,6 +116,35 @@ pub fn reply_code(v: &Value) -> Option<ReplyCode> {
     Some(ReplyCode::from_i64(code))
 }
 
+/// Whether a phone push is a "connect requested" event — the user tapped 「连接」
+/// in the connection center. On the wire it is `bytes:[24]` with an `extra_info`
+/// carrying `connectType:"Connect"`. The official desktop reacts by opening the
+/// 10380 control session (it does NOT start mirroring — that is a later step).
+pub fn is_connect_request(v: &Value) -> bool {
+    let code = v
+        .get("bytes")
+        .and_then(Value::as_array)
+        .and_then(|a| a.first())
+        .and_then(Value::as_i64);
+    if code != Some(24) {
+        return false;
+    }
+    // Confirm connectType is "Connect" (vs "PreConnect", the remote-wake variant)
+    // when the field is present; tolerate its absence.
+    match v.get("extra_info").and_then(Value::as_str) {
+        Some(ei) => serde_json::from_str::<Value>(ei)
+            .ok()
+            .and_then(|e| {
+                e.get("ext")
+                    .and_then(|x| x.get("connectType"))
+                    .and_then(Value::as_str)
+                    .map(|ct| ct.eq_ignore_ascii_case("Connect"))
+            })
+            .unwrap_or(true),
+        None => true,
+    }
+}
+
 /// Extract `auth_status` from a phone reply. The status lives in a doubly-encoded
 /// JSON string: `extra_info` (a JSON string) → `forwardData` (a JSON string) →
 /// `{ "auth_status": bool, "connect_status": bool }`. `true` means the phone

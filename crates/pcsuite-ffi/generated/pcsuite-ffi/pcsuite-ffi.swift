@@ -356,6 +356,10 @@ extension PcCloudPresenceRef {
         RustString(ptr: __swift_bridge__$PcCloudPresence$status(ptr))
     }
 
+    public func take_connect_request() -> Bool {
+        __swift_bridge__$PcCloudPresence$take_connect_request(ptr)
+    }
+
     public func stop() {
         __swift_bridge__$PcCloudPresence$stop(ptr)
     }

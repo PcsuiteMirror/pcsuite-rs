@@ -240,7 +240,11 @@ pub struct PresenceConfig {
 /// Falsified alternatives (do not reintroduce): the discoverable state is NOT
 /// maintained by vpush(MQTT), the `getUserCookie` cloud heartbeat, or SSDP
 /// beacons — only by this held LAN connection (see docs/LAN_DISCOVERY_HANDOFF.md).
-pub async fn presence_once<F: FnOnce()>(cfg: &PresenceConfig, on_ready: F) -> Result<()> {
+pub async fn presence_once<F: FnOnce(), G: Fn()>(
+    cfg: &PresenceConfig,
+    on_ready: F,
+    on_connect_request: G,
+) -> Result<()> {
     tracing::info!(phone = %cfg.phone_ip, remote = cfg.remote, "presence: connecting 10191");
     let mut sock = tcp::connect(&cfg.phone_ip, 10191)
         .await
@@ -309,6 +313,13 @@ pub async fn presence_once<F: FnOnce()>(cfg: &PresenceConfig, on_ready: F) -> Re
                         json = %v,
                         "presence: phone push"
                     );
+                    // `bytes:[24]` = the phone tapped "连接" (wlan_mobile_ask_connect_pc):
+                    // the official service forwards this to the desktop app, which then
+                    // opens the 10380 control session. Signal the caller to do the same.
+                    if connect::is_connect_request(&v) {
+                        tracing::info!("presence: phone requested connect (bytes:[24])");
+                        on_connect_request();
+                    }
                 } else {
                     tracing::info!(
                         bytes = n,
