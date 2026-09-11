@@ -281,17 +281,13 @@ pub async fn presence_once<F: FnOnce()>(cfg: &PresenceConfig, on_ready: F) -> Re
     let code = reply.as_ref().and_then(connect::reply_code);
     let auth = reply.as_ref().and_then(connect::auth_status);
     tracing::info!(?code, ?auth, "presence connect reply");
-    // Accepted iff the phone replied Success (bytes:[1]) or auth_status=true.
-    // A Reject (bytes:[2]) or auth_status=false means wrong IP / seed / not paired.
-    let accepted = matches!(code, Some(connect::ReplyCode::Success)) || auth == Some(true);
-    if !accepted {
-        bail!(
-            "phone did not accept presence (reply code {:?}, auth_status {:?}) — \
-             wrong phone IP / seed, or this PC isn't paired for that IP",
-            code,
-            auth
-        );
-    }
+    // Presence only needs the connection HELD open — the phone lists this PC as
+    // 「可连」 for as long as it lives, regardless of the connect reply code (an
+    // OpenIdMismatch/Reject on the *connect* step does not un-list us; only the
+    // connection dropping does). So do not bail on the code — just record it and
+    // hold. The code still matters for the actual connect/mirror escalation, which
+    // is a separate ConnectFlow.
+    tracing::info!(?code, ?auth, "presence: holding (any code keeps 可连 while the socket lives)");
 
     on_ready();
 
@@ -307,9 +303,18 @@ pub async fn presence_once<F: FnOnce()>(cfg: &PresenceConfig, on_ready: F) -> Re
             }
             Ok(n) => {
                 if let Some((v, _)) = payload1::parse_reply_lenient(&tmp[..n]) {
-                    tracing::info!(code = ?connect::reply_code(&v), bytes = n, "presence: phone push");
+                    tracing::info!(
+                        code = ?connect::reply_code(&v),
+                        bytes = n,
+                        json = %v,
+                        "presence: phone push"
+                    );
                 } else {
-                    tracing::debug!(bytes = n, "presence: phone data (unparsed)");
+                    tracing::info!(
+                        bytes = n,
+                        hex = %hex::encode(&tmp[..n.min(400)]),
+                        "presence: phone data (unparsed)"
+                    );
                 }
             }
             Err(e) => return Err(e).context("presence connection read"),

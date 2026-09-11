@@ -1074,6 +1074,15 @@ fn pcsuite_cloud_presence_start(phone_ip: String, remote: bool) -> PcCloudPresen
     let status = Arc::new(Mutex::new("connecting".to_string()));
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
 
+    // The LAN sign must carry the account's openId (the phone rejects a mismatch
+    // with bytes:[28]). If only the cloud account has it (identity still on the
+    // placeholder), feed it into the identity so the sign verifies.
+    if config::default_identity().open_id == config::OPEN_ID_PLACEHOLDER {
+        let oid = cloud_account().read().unwrap().open_id.clone();
+        if !oid.is_empty() {
+            config::set_open_id(oid);
+        }
+    }
     let identity = config::default_identity();
     // Guard the placeholder businessId here too — holding a connection under it
     // just wastes effort (the phone can't link it to the device → 「未发现」).

@@ -1195,6 +1195,13 @@ async fn cmd_cloud(args: Args) -> Result<()> {
 /// discovery mechanism the official Windows service (`vivoesService`) uses;
 /// vpush / cloud heartbeat / SSDP are all unnecessary. Runs until Ctrl+C.
 async fn cmd_cloud_presence(args: &Args) -> Result<()> {
+    // The LAN sign carries the openId the phone checks against its own account
+    // (connbase rejects a mismatch with bytes:[28]). In account mode that openId
+    // lives in the account, not the config identity — feed it in, or the sign
+    // goes out with the placeholder openId and the phone rejects it.
+    if let Some(acc) = cloud::load_account() {
+        config::set_open_id(acc.open_id);
+    }
     let identity = config::default_identity();
     if config::is_pc_mac_placeholder(&identity.pc_mac) {
         anyhow::bail!(
