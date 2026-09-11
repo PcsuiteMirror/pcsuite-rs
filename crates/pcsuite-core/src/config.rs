@@ -96,6 +96,26 @@ struct UserConfig {
     mode: Mode,
 }
 
+/// The machine's hostname via POSIX `gethostname` (no extra crate). On macOS this
+/// is e.g. "xvans-MBP"; a GUI app usually overrides it with the nicer
+/// `ComputerName` via [`set_identity`], so this is only the headless default.
+fn system_hostname() -> Option<String> {
+    extern "C" {
+        fn gethostname(name: *mut std::os::raw::c_char, len: usize) -> std::os::raw::c_int;
+    }
+    let mut buf = [0u8; 256];
+    let rc = unsafe { gethostname(buf.as_mut_ptr() as *mut std::os::raw::c_char, buf.len()) };
+    if rc != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let name = String::from_utf8_lossy(&buf[..end])
+        .trim()
+        .trim_end_matches(".local")
+        .to_string();
+    (!name.is_empty()).then_some(name)
+}
+
 fn load() -> &'static UserConfig {
     static CFG: OnceLock<UserConfig> = OnceLock::new();
     CFG.get_or_init(|| {
@@ -120,11 +140,15 @@ fn load() -> &'static UserConfig {
             .ok()
             .or_else(|| file.get("seed").and_then(|v| v.as_str()).map(str::to_owned));
 
+        // Default device name = the machine's own hostname, so a fresh install
+        // registers under a real name instead of a generic placeholder.
+        let default_name = system_hostname().unwrap_or_else(|| "pcsuite".to_owned());
+
         UserConfig {
             open_id: pick("PCSUITE_OPEN_ID", "open_id", OPEN_ID_PLACEHOLDER),
             pc_mac: pick("PCSUITE_PC_MAC", "pc_mac", "000000000000"),
             account: pick("PCSUITE_ACCOUNT", "account", ""),
-            device_name: pick("PCSUITE_DEVICE_NAME", "device_name", "pcsuite-pc"),
+            device_name: pick("PCSUITE_DEVICE_NAME", "device_name", &default_name),
             clip_pc_id: pick("PCSUITE_CLIP_PC_ID", "clip_pc_id", CLIP_PC_ID_DEFAULT),
             default_seed,
             seeds,
