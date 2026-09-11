@@ -1239,31 +1239,21 @@ async fn cmd_cloud_presence(args: &Args) -> Result<()> {
     // When the phone taps 「连接」 it pushes bytes:[24] on the held connection; a
     // worker then opens the 10380 control session (connect only, no mirror), which
     // is what makes the phone show 「已连接」.
-    let (req_tx, mut req_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let (req_tx, mut req_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let conn_ip = phone_ip.clone();
-    let conn_remote = args.remote;
     tokio::spawn(async move {
-        while req_rx.recv().await.is_some() {
-            println!("📲 手机请求连接 → 建立控制会话(不投屏)…");
-            // Use connectType=1 (no pre-shared seed) for the escalation — it needs
-            // only the account openId (already set) and works on any network.
-            let _ = conn_remote;
-            let reg = register(RegisterConfig {
-                reg_ip: conn_ip.clone(),
-                identity: config::default_identity(),
-                stored_seed: None,
-                remote: true,
-                token: None,
-                conn_id: None,
-                presence: false,
-            })
-            .await;
-            match reg {
-                Ok(r) => match Session::connect(&conn_ip, &r.token).await {
-                    Ok(_s) => println!("   ✅ 已连接 (10380 控制会话已建立)。投屏用 `pcsuite screen` 另起。"),
-                    Err(e) => println!("   控制会话建立失败: {e:#}"),
-                },
-                Err(e) => println!("   连接失败(10380 未开): {e:#}"),
+        let mut _session: Option<Session> = None;
+        while let Some(token) = req_rx.recv().await {
+            println!("📲 手机请求连接 → 用 presence 的 token 开控制会话(复用同一连接, 不投屏)…");
+            // Reuse the token presence already registered on its held 10191
+            // connection — the phone opened 10380 for it — instead of registering a
+            // second 10191 connection. Keep the Session alive so the link persists.
+            match Session::connect(&conn_ip, &token).await {
+                Ok(s) => {
+                    println!("   ✅ 已连接 (10380 控制会话, 复用 presence token)。投屏用 `pcsuite screen` 另起。");
+                    _session = Some(s);
+                }
+                Err(e) => println!("   控制会话失败: {e:#}"),
             }
         }
     });
@@ -1278,15 +1268,24 @@ async fn cmd_cloud_presence(args: &Args) -> Result<()> {
                 || {
                     println!("   ✅ 握手被接受，正在保持连接 = 手机应显示「可连」(断/连 wifi 刷新)");
                 },
-                move || {
-                    let _ = req_tx.send(());
+                move |token: &str| {
+                    let _ = req_tx.send(token.to_string());
                 },
             )
             .await
             {
-                Ok(()) => {
+                Ok(pcsuite_core::PresenceOutcome::Ended) => {
                     println!("   连接被手机关闭，1s 后重连…");
                     backoff = Duration::from_secs(1);
+                }
+                Ok(pcsuite_core::PresenceOutcome::ConnectRequested) => {
+                    // The session worker is opening 10380 with this connection's
+                    // token. Do NOT re-hold presence — a fresh register would knock
+                    // that session out. Pause presence while the session lives; the
+                    // phone closing 10191 here is the normal hand-off.
+                    println!("   → 手机发起连接，presence 暂停(会话接管);会话结束后可 Ctrl+C 重来。");
+                    // keep the process alive so the session worker's session persists.
+                    std::future::pending::<()>().await;
                 }
                 Err(e) => {
                     eprintln!("   presence 断开: {e:#}；{}s 后重连…", backoff.as_secs());

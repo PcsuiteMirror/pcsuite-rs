@@ -1148,15 +1148,23 @@ fn pcsuite_cloud_presence_start(phone_ip: String, remote: bool) -> PcCloudPresen
                 move || {
                     *st_ready.lock().unwrap() = "holding".into();
                 },
-                move || {
+                move |_token: &str| {
                     req.store(true, std::sync::atomic::Ordering::SeqCst);
                 },
             );
             tokio::select! {
                 r = once => match r {
-                    Ok(()) => {
+                    Ok(pcsuite_core::PresenceOutcome::Ended) => {
                         *st.lock().unwrap() = "reconnecting".into();
                         backoff = Duration::from_secs(1);
+                    }
+                    Ok(pcsuite_core::PresenceOutcome::ConnectRequested) => {
+                        // The phone tapped 「连接」; the flag is set for the app to open
+                        // the session. Stop holding presence — a reconnect here would
+                        // register a fresh token and knock that session out. The app
+                        // restarts a new presence when the session disconnects.
+                        *st.lock().unwrap() = "connect-handoff".into();
+                        break;
                     }
                     Err(e) => *st.lock().unwrap() = format!("error: {e:#}"),
                 },

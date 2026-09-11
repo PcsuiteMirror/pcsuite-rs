@@ -240,11 +240,22 @@ pub struct PresenceConfig {
 /// Falsified alternatives (do not reintroduce): the discoverable state is NOT
 /// maintained by vpush(MQTT), the `getUserCookie` cloud heartbeat, or SSDP
 /// beacons — only by this held LAN connection (see docs/LAN_DISCOVERY_HANDOFF.md).
-pub async fn presence_once<F: FnOnce(), G: Fn()>(
+/// Outcome of one [`presence_once`] hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresenceOutcome {
+    /// The phone closed the held connection (roam / idle) — reconnect to keep 可连.
+    Ended,
+    /// The phone tapped 「连接」 (bytes:[24]); the caller should open the 10380
+    /// session with the handed-over token and NOT immediately re-hold presence — a
+    /// presence reconnect would register a fresh token and knock out that session.
+    ConnectRequested,
+}
+
+pub async fn presence_once<F: FnOnce(), G: Fn(&str)>(
     cfg: &PresenceConfig,
     on_ready: F,
     on_connect_request: G,
-) -> Result<()> {
+) -> Result<PresenceOutcome> {
     tracing::info!(phone = %cfg.phone_ip, remote = cfg.remote, "presence: connecting 10191");
     let mut sock = tcp::connect(&cfg.phone_ip, 10191)
         .await
@@ -303,7 +314,7 @@ pub async fn presence_once<F: FnOnce(), G: Fn()>(
         match sock.read(&mut tmp).await {
             Ok(0) => {
                 tracing::info!("presence: phone closed the connection (EOF)");
-                return Ok(());
+                return Ok(PresenceOutcome::Ended);
             }
             Ok(n) => {
                 if let Some((v, _)) = payload1::parse_reply_lenient(&tmp[..n]) {
@@ -314,11 +325,14 @@ pub async fn presence_once<F: FnOnce(), G: Fn()>(
                         "presence: phone push"
                     );
                     // `bytes:[24]` = the phone tapped "连接" (wlan_mobile_ask_connect_pc):
-                    // the official service forwards this to the desktop app, which then
-                    // opens the 10380 control session. Signal the caller to do the same.
+                    // hand the caller THIS held connection's token (the phone already
+                    // opened 10380 for it) so it can open the control session by reusing
+                    // this connection — then STOP holding presence and return, so a
+                    // reconnect doesn't register a fresh token and knock that session out.
                     if connect::is_connect_request(&v) {
                         tracing::info!("presence: phone requested connect (bytes:[24])");
-                        on_connect_request();
+                        on_connect_request(&token);
+                        return Ok(PresenceOutcome::ConnectRequested);
                     }
                 } else {
                     tracing::info!(
