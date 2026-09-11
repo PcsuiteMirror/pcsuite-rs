@@ -217,6 +217,49 @@ pub fn mode() -> Mode {
 /// that won't pass the phone's account check. Keep in sync with `load()`.
 pub const OPEN_ID_PLACEHOLDER: &str = "0000000000000000";
 
+/// Placeholder PC businessId (`pc_mac`) — the default when nothing is configured.
+/// Registering under this value makes the phone unable to associate the LAN
+/// ConnectFlow connection with the listed device, so it stays "未发现". Keep in
+/// sync with `load()`.
+pub const PC_MAC_PLACEHOLDER: &str = "000000000000";
+
+/// Whether `pc_mac` is still the unusable placeholder (or empty).
+pub fn is_pc_mac_placeholder(mac: &str) -> bool {
+    mac.is_empty() || mac == PC_MAC_PLACEHOLDER
+}
+
+/// Persist `pc_mac` into the JSON config file so later invocations (and the
+/// presence command) reuse the same businessId without an env var. Writes to
+/// `$PCSUITE_CONFIG`, else `pcsuite.json` in the cwd if it exists, else
+/// `~/.config/pcsuite/config.json`. Merges into any existing object.
+pub fn persist_pc_mac(mac: &str) -> std::io::Result<std::path::PathBuf> {
+    let path = std::env::var("PCSUITE_CONFIG")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            let cwd = std::path::PathBuf::from("pcsuite.json");
+            cwd.exists().then_some(cwd)
+        })
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| std::path::PathBuf::from(h).join(".config/pcsuite/config.json"))
+        })
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no config path (no HOME)"))?;
+
+    let mut obj = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    obj.insert("pc_mac".into(), serde_json::Value::String(mac.to_owned()));
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(&obj).unwrap_or_default())?;
+    Ok(path)
+}
+
 /// Override just the account openId (empty = clear). Used to self-fill the openId
 /// learned from the phone's `/base-info` when a session connected without one (e.g.
 /// QR pairing), so the cowork clipboard handshake carries the real account value.

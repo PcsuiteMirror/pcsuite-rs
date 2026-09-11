@@ -178,6 +178,8 @@ pub async fn register(cfg: RegisterConfig) -> Result<Registration> {
         &seed_b,
         &sign,
         connect_type,
+        false,
+        620,
     ))?;
     sock.write_all(&cframe).await?;
     sock.flush().await?;
@@ -211,4 +213,106 @@ pub async fn register(cfg: RegisterConfig) -> Result<Registration> {
         conn_id,
         presence_task: presence_task.and_then(PresenceGuard::release),
     })
+}
+
+/// Inputs to [`presence_once`].
+pub struct PresenceConfig {
+    /// Phone LAN IP to hold the 10191 ConnectFlow connection to.
+    pub phone_ip: String,
+    /// PC identity. `pc_mac` (the `target_id`) MUST match the businessId this PC
+    /// is registered under in the connection center, or the phone accepts the
+    /// connection but never associates it with the listed device (stays "未发现").
+    pub identity: PcIdentity,
+    /// Per-IP stored seed for `connectType=2`. Ignored when `remote`.
+    pub stored_seed: Option<String>,
+    /// Use the `connectType=1` remote path instead of a pre-shared seed.
+    pub remote: bool,
+}
+
+/// Do the 10191 ConnectFlow handshake, then **hold the connection open** — which
+/// is exactly what keeps the phone listing this PC as discoverable ("可连").
+///
+/// Unlike [`register`], this does not escalate to 10380: `connect_status` stays
+/// `false`, the socket is kept open, and the function only returns when the phone
+/// closes it (EOF) or an error occurs — so the caller can reconnect. `on_ready`
+/// fires once the handshake is accepted (auth_status true / reply code Success).
+///
+/// Falsified alternatives (do not reintroduce): the discoverable state is NOT
+/// maintained by vpush(MQTT), the `getUserCookie` cloud heartbeat, or SSDP
+/// beacons — only by this held LAN connection (see docs/LAN_DISCOVERY_HANDOFF.md).
+pub async fn presence_once<F: FnOnce()>(cfg: &PresenceConfig, on_ready: F) -> Result<()> {
+    tracing::info!(phone = %cfg.phone_ip, remote = cfg.remote, "presence: connecting 10191");
+    let mut sock = tcp::connect(&cfg.phone_ip, 10191)
+        .await
+        .context("connect 10191 (phone idle / WiFi off / IP changed?)")?;
+
+    // [1] device-info exchange
+    let dframe = payload1::encode_json(&connect::device_info_frame(&cfg.identity, 22))?;
+    sock.write_all(&dframe).await?;
+    sock.flush().await?;
+    if let Some(v) = read_reply(&mut sock, Duration::from_secs(8)).await {
+        tracing::info!(code = ?connect::reply_code(&v), "device_info reply");
+    }
+
+    // [2] connect frame (seed + sign), with the presence auto-connect flags
+    let seed = if cfg.remote {
+        String::new()
+    } else {
+        cfg.stored_seed
+            .clone()
+            .context("presence LAN mode needs a stored seed for this phone IP (or pass remote = true)")?
+    };
+    let token = random_token();
+    let conn_id = format!("pcsuite_presence_{}", epoch_secs());
+    let seed_b = uuid::Uuid::new_v4().to_string().to_uppercase();
+    let sign = pcsuite_crypto::make_sign(&cfg.identity.open_id, &conn_id, &token, &seed, &seed_b);
+    let connect_type = if cfg.remote { 1 } else { 2 };
+    let cframe = payload1::encode_json(&connect::connect_frame(
+        &cfg.identity,
+        &seed_b,
+        &sign,
+        connect_type,
+        true,
+        680,
+    ))?;
+    sock.write_all(&cframe).await?;
+    sock.flush().await?;
+    let reply = read_reply(&mut sock, Duration::from_secs(8)).await;
+    let code = reply.as_ref().and_then(connect::reply_code);
+    let auth = reply.as_ref().and_then(connect::auth_status);
+    tracing::info!(?code, ?auth, "presence connect reply");
+    // Accepted iff the phone replied Success (bytes:[1]) or auth_status=true.
+    // A Reject (bytes:[2]) or auth_status=false means wrong IP / seed / not paired.
+    let accepted = matches!(code, Some(connect::ReplyCode::Success)) || auth == Some(true);
+    if !accepted {
+        bail!(
+            "phone did not accept presence (reply code {:?}, auth_status {:?}) — \
+             wrong phone IP / seed, or this PC isn't paired for that IP",
+            code,
+            auth
+        );
+    }
+
+    on_ready();
+
+    // [3] Hold the connection open. The phone keeps this PC "可连" for as long as
+    // the connection lives; it may also push frames here (e.g. when the user taps
+    // "connect" on the phone), which we surface for the caller to act on later.
+    let mut tmp = [0u8; 8192];
+    loop {
+        match sock.read(&mut tmp).await {
+            Ok(0) => {
+                tracing::info!("presence: phone closed the connection (EOF)");
+                return Ok(());
+            }
+            Ok(n) => {
+                if let Some((v, _)) = payload1::parse_reply_lenient(&tmp[..n]) {
+                    tracing::info!(code = ?connect::reply_code(&v), bytes = n, "presence: phone push");
+                } else {
+                    tracing::debug!(bytes = n, "presence: phone data (unparsed)");
+                }
+            }
+            Err(e) => return Err(e).context("presence connection read"),
+        }
+    }
 }

@@ -417,6 +417,16 @@ impl ConnectCenter {
     /// push into a void.
     pub async fn register_self_with(&self, push_client_id: Option<&str>) -> Result<()> {
         let id = config::default_identity();
+        if config::is_pc_mac_placeholder(&id.pc_mac) {
+            bail!(
+                "refusing to register with placeholder businessId {:?}: the phone would accept the \
+                 LAN connection but never link it to this device, so it stays 「未发现」. Set a real, \
+                 stable businessId first — `PCSUITE_PC_MAC=<12hex> pcsuite cloud register` (it gets \
+                 persisted), or add \"pc_mac\" to the config. Use the value the phone already knows \
+                 this PC by (see docs/LAN_DISCOVERY_HANDOFF.md).",
+                id.pc_mac
+            );
+        }
         let inets = local_ipv4s();
         if inets.is_empty() {
             tracing::warn!("no LAN address detected; the phone will not be able to reach this PC");
@@ -430,9 +440,15 @@ impl ConnectCenter {
             None => self.existing_push_client_id().await,
         };
         if push_client_id.is_none() {
-            tracing::warn!(
-                "no push client id registered for this PC — the phone will list it as undiscovered \
-                 until a push client registers one (see docs/VIVO_ACCOUNT_LOGIN.md §5)"
+            // Discovery does NOT need a push client id — that was disproven
+            // 2026-09-11. The phone lists this PC as "可连" while a 10191
+            // ConnectFlow connection is held open (`pcsuite cloud presence`);
+            // pushInfo.clientId is only for *remote* wake-up (vpush), a separate
+            // line. See docs/LAN_DISCOVERY_HANDOFF.md.
+            tracing::info!(
+                "registered without a push client id — fine for LAN discovery; run \
+                 `pcsuite cloud presence` to hold the connection that makes the phone show 「可连」. \
+                 (pushInfo.clientId is only needed for remote wake-up.)"
             );
         }
         self.report_device(&id.device_name, &id.pc_mac, &inets, push_client_id.as_deref())

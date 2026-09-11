@@ -74,14 +74,27 @@ pub fn device_info_frame(id: &PcIdentity, code: i64) -> Value {
 ///
 /// `connect_type`: `2` for LAN (per-IP stored seed), `1` for the remote path
 /// (`key = SHA256(seed_b)`, no pre-shared seed).
-pub fn connect_frame(id: &PcIdentity, seed_b: &str, sign: &str, connect_type: i64) -> Value {
+///
+/// `auto_connect` sets `isAutoConnect`/`isAutoConnectNew` ("1" when true). The
+/// discoverable-presence path (holding 10191 open so the phone lists this PC as
+/// "可连") uses `true` + `pc_version = 680`, matching the official service captured
+/// on Windows; the one-shot active-connect path keeps `false` + its own version.
+pub fn connect_frame(
+    id: &PcIdentity,
+    seed_b: &str,
+    sign: &str,
+    connect_type: i64,
+    auto_connect: bool,
+    pc_version: i64,
+) -> Value {
+    let ac = if auto_connect { "1" } else { "0" };
     let extra = json!({
-        "isAutoConnect": "0",
-        "isAutoConnectNew": "0",
+        "isAutoConnect": ac,
+        "isAutoConnectNew": ac,
         "seed": seed_b,
         "sign": sign,
         "connectType": connect_type,
-        "pcPcsuiteVersion": 620,
+        "pcPcsuiteVersion": pc_version,
     });
     json!({
         "target_id": id.pc_mac,
@@ -101,6 +114,18 @@ pub fn connect_frame(id: &PcIdentity, seed_b: &str, sign: &str, connect_type: i6
 pub fn reply_code(v: &Value) -> Option<ReplyCode> {
     let code = v.get("bytes")?.as_array()?.first()?.as_i64()?;
     Some(ReplyCode::from_i64(code))
+}
+
+/// Extract `auth_status` from a phone reply. The status lives in a doubly-encoded
+/// JSON string: `extra_info` (a JSON string) → `forwardData` (a JSON string) →
+/// `{ "auth_status": bool, "connect_status": bool }`. `true` means the phone
+/// accepted our sign; `connect_status` stays `false` for mere presence.
+pub fn auth_status(v: &Value) -> Option<bool> {
+    let ei = v.get("extra_info")?.as_str()?;
+    let ei: Value = serde_json::from_str(ei).ok()?;
+    let fd = ei.get("forwardData")?.as_str()?;
+    let fd: Value = serde_json::from_str(fd).ok()?;
+    fd.get("auth_status")?.as_bool()
 }
 
 /// SSDP `compatGsonStr` presence payload describing this PC (base64-encoded by
@@ -149,7 +174,7 @@ mod tests {
 
     #[test]
     fn connect_extra_info_is_stringified_json() {
-        let v = connect_frame(&id(), "SEED-B-UUID", "deadbeef", 1);
+        let v = connect_frame(&id(), "SEED-B-UUID", "deadbeef", 1, false, 620);
         // extra_info must be a JSON *string*, not an object.
         let s = v["extra_info"].as_str().expect("extra_info is a string");
         let extra: serde_json::Value = serde_json::from_str(s).unwrap();
@@ -157,7 +182,32 @@ mod tests {
         assert_eq!(extra["sign"], "deadbeef");
         assert_eq!(extra["connectType"], 1);
         assert_eq!(extra["pcPcsuiteVersion"], 620);
+        assert_eq!(extra["isAutoConnect"], "0");
         assert_eq!(v["bytes"][0], 0);
+    }
+
+    #[test]
+    fn presence_connect_frame_uses_auto_connect() {
+        let v = connect_frame(&id(), "SEED-B-UUID", "deadbeef", 2, true, 680);
+        let s = v["extra_info"].as_str().unwrap();
+        let extra: serde_json::Value = serde_json::from_str(s).unwrap();
+        assert_eq!(extra["isAutoConnect"], "1");
+        assert_eq!(extra["isAutoConnectNew"], "1");
+        assert_eq!(extra["pcPcsuiteVersion"], 680);
+    }
+
+    #[test]
+    fn auth_status_parses_doubly_encoded_forward_data() {
+        let reply = json!({
+            "bytes": [1],
+            "extra_info": serde_json::to_string(&json!({
+                "forwardData": serde_json::to_string(&json!({
+                    "auth_status": true, "connect_status": false
+                })).unwrap()
+            })).unwrap(),
+        });
+        assert_eq!(auth_status(&reply), Some(true));
+        assert_eq!(auth_status(&json!({"bytes":[1]})), None);
     }
 
     #[test]

@@ -23,9 +23,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use pcsuite_core::{
-    cloud, config, device, mdfs, pair, register, run_clipboard, run_notify, run_verify, usb,
-    ClipboardBackend, ClipboardConfig, ListKind, NotifyConfig, RegisterConfig, Registration, Screen,
-    ScreenParams, Session, UsbConfig, VerifyConfig,
+    cloud, config, device, mdfs, pair, presence_once, register, run_clipboard, run_notify,
+    run_verify, usb, ClipboardBackend, ClipboardConfig, ListKind, NotifyConfig, PresenceConfig,
+    RegisterConfig, Registration, Screen, ScreenParams, Session, UsbConfig, VerifyConfig,
 };
 
 struct Args {
@@ -66,6 +66,9 @@ struct Args {
     push_client_id: Option<String>,
     /// `cloud events` probe: fetch one event by id (omit to try enumerating).
     event_id: Option<String>,
+    /// `cloud presence` / connect: per-IP stored seed (connectType=2); else read
+    /// from the phone's published `ext.seeds`, then config.
+    seed: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -97,6 +100,7 @@ fn parse_args() -> Args {
         token: None,
         push_client_id: None,
         event_id: None,
+        seed: None,
     };
     let mut i = 1;
     while i < raw.len() {
@@ -163,6 +167,10 @@ fn parse_args() -> Args {
                 i += 1;
                 a.event_id = raw.get(i).cloned();
             }
+            "--seed" => {
+                i += 1;
+                a.seed = raw.get(i).cloned();
+            }
             _ => {
                 // Positional args (push 的本地文件列表 / cloud 的子命令)；未知 --flag 照旧忽略。
                 if !flag.starts_with("--") {
@@ -197,7 +205,8 @@ fn print_help() {
          pcsuite share-recv [--out <本地目录>]   (互传/EasyShare 接收：独立 10191 监听，无需连接会话)\n  \
          pcsuite all (--usb | --phone <IP> [--remote]) [--screen|--clipboard|--verify|--notify] \
          [--seconds <N>] [--out <f>]\n  \
-         pcsuite cloud status|register|devices|events|logout   (vivo 账号模式：把本机注册到连接中心)\n  \
+         pcsuite cloud status|login|register|presence|devices|events|logout   (vivo 账号模式)\n  \
+         pcsuite cloud presence [--phone <IP>] [--seed <SEED>] [--remote]   (保持在线, 手机显示「可连」; 先 register)\n  \
          pcsuite cloud login --open-id <ID> --token <TOKEN>   (凭据来自 app 的扫码登录)\n\
          \x20                                       (clipboard+verify+notify in the background; type\n\
          \x20                                        `screen on`/`screen off` at the prompt to\n\
@@ -1119,13 +1128,23 @@ async fn cmd_cloud(args: Args) -> Result<()> {
         "register" => {
             let cc = cloud::ConnectCenter::new(require_account()?)?;
             cc.register_self_with(args.push_client_id.as_deref()).await?;
+            // Persist the (real) businessId so `cloud presence` reuses it without
+            // an env var — the two MUST agree or the phone shows 「未发现」.
+            let mac = config::default_identity().pc_mac;
+            if !config::is_pc_mac_placeholder(&mac) {
+                match config::persist_pc_mac(&mac) {
+                    Ok(p) => println!("   businessId {mac} 已写入 {}", p.display()),
+                    Err(e) => println!("   (提示: businessId {mac} 未能持久化: {e})"),
+                }
+            }
             println!("✅ 已把本机注册到连接中心, deviceId={}", cc.device_id());
             if let Some(id) = &args.push_client_id {
                 println!("   pushInfo.clientId = {id}");
             }
-            println!("   手机端「连接中心」里现在应该能看到这台电脑。");
+            println!("   下一步: pcsuite cloud presence   (保持在线, 让手机显示「可连」)");
             Ok(())
         }
+        "presence" => cmd_cloud_presence(&args).await,
         "raw" => {
             let cc = cloud::ConnectCenter::new(require_account()?)?;
             let path = args.path.clone().unwrap_or_else(|| "/device/list".into());
@@ -1164,10 +1183,142 @@ async fn cmd_cloud(args: Args) -> Result<()> {
         }
         other => {
             anyhow::bail!(
-                "unknown cloud subcommand: {other} (status|login|register|devices|events|logout)"
+                "unknown cloud subcommand: {other} \
+                 (status|login|register|presence|devices|events|logout)"
             )
         }
     }
+}
+
+/// `pcsuite cloud presence` — hold a 10191 ConnectFlow connection to the phone so
+/// it lists this PC as discoverable ("可连"), reconnecting on drop. This is the
+/// discovery mechanism the official Windows service (`vivoesService`) uses;
+/// vpush / cloud heartbeat / SSDP are all unnecessary. Runs until Ctrl+C.
+async fn cmd_cloud_presence(args: &Args) -> Result<()> {
+    let identity = config::default_identity();
+    if config::is_pc_mac_placeholder(&identity.pc_mac) {
+        anyhow::bail!(
+            "no real businessId configured (pc_mac = {:?}). Run \
+             `PCSUITE_PC_MAC=<12hex> pcsuite cloud register` first — the phone matches the held \
+             connection to this PC by that id.",
+            identity.pc_mac
+        );
+    }
+
+    // Resolve phone IP + seed: explicit flags win, else the connection center's
+    // device list (which also publishes the phone's connectType=2 seed).
+    let (phone_ip, seed) = if args.remote {
+        // remote path needs no seed; still needs a phone IP.
+        let ip = resolve_phone_ip(args).await?;
+        (ip, None)
+    } else {
+        match (args.phone.clone(), args.seed.clone()) {
+            (Some(ip), Some(s)) => (ip, Some(s)),
+            _ => resolve_phone_and_seed(args).await?,
+        }
+    };
+
+    let cfg = PresenceConfig {
+        phone_ip: phone_ip.clone(),
+        identity,
+        stored_seed: seed,
+        remote: args.remote,
+    };
+    println!(
+        "🟢 presence: 保持 10191 连接到手机 {} (businessId={})，Ctrl+C 停止",
+        phone_ip, cfg.identity.pc_mac
+    );
+
+    // Reconnect loop with backoff; Ctrl+C exits.
+    let run = async {
+        let mut backoff = Duration::from_secs(1);
+        loop {
+            match presence_once(&cfg, || {
+                println!("   ✅ 握手被接受，正在保持连接 = 手机应显示「可连」(断/连 wifi 刷新)");
+            })
+            .await
+            {
+                Ok(()) => {
+                    println!("   连接被手机关闭，{}s 后重连…", 1);
+                    backoff = Duration::from_secs(1);
+                }
+                Err(e) => {
+                    eprintln!("   presence 断开: {e:#}；{}s 后重连…", backoff.as_secs());
+                }
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_secs(30));
+        }
+    };
+
+    tokio::select! {
+        _ = run => Ok(()),
+        r = tokio::signal::ctrl_c() => {
+            r.ok();
+            println!("\n🔴 停止 presence — 连接已断，手机刷新后将变「未发现」");
+            Ok(())
+        }
+    }
+}
+
+/// The `a.b.c` /24 prefix of a dotted IPv4, for same-subnet matching.
+fn subnet24(ip: &str) -> Option<String> {
+    let mut it = ip.split('.');
+    let (a, b, c) = (it.next()?, it.next()?, it.next()?);
+    it.next()?; // require a 4th octet
+    Some(format!("{a}.{b}.{c}"))
+}
+
+/// Pick the phone LAN IP reachable from this machine: prefer one sharing a /24
+/// with a local address (the device list can carry stale addresses from other
+/// networks — e.g. a `192.168.1.x` left over when we're now on `192.168.31.x`).
+fn pick_reachable_ip(inets: &[String]) -> Option<String> {
+    let locals = cloud::local_ipv4s();
+    let local_subnets: Vec<String> = locals.iter().filter_map(|s| subnet24(s)).collect();
+    inets
+        .iter()
+        .find(|ip| subnet24(ip).map(|s| local_subnets.contains(&s)).unwrap_or(false))
+        .or_else(|| inets.first())
+        .cloned()
+}
+
+/// Find the account's phone IP from the connection center device list.
+async fn resolve_phone_ip(args: &Args) -> Result<String> {
+    if let Some(ip) = args.phone.clone() {
+        return Ok(ip);
+    }
+    let cc = cloud::ConnectCenter::new(require_account()?)?;
+    let list = cc.device_list().await?;
+    list.iter()
+        .filter(|d| d.is_phone())
+        .find_map(|d| pick_reachable_ip(&d.inets))
+        .context("device list has no reachable phone; pass --phone <IP>")
+}
+
+/// Find the phone IP and its published connectType=2 seed from the device list.
+async fn resolve_phone_and_seed(args: &Args) -> Result<(String, Option<String>)> {
+    let cc = cloud::ConnectCenter::new(require_account()?)?;
+    let list = cc.device_list().await?;
+    let phone = list
+        .iter()
+        .find(|d| d.is_phone() && !d.inets.is_empty())
+        .context("device list has no reachable phone; pass --phone <IP> [--seed <SEED>]")?;
+    let ip = args
+        .phone
+        .clone()
+        .or_else(|| pick_reachable_ip(&phone.inets))
+        .context("no phone IP")?;
+    // Seed: explicit flag, else the phone's published seed for its own IP, else
+    // whatever the config holds for this IP.
+    let seed = args.seed.clone().or_else(|| {
+        phone
+            .seeds
+            .get(&ip)
+            .or_else(|| phone.seeds.values().next())
+            .cloned()
+            .or_else(|| config::default_stored_seed(&ip))
+    });
+    Ok((ip, seed))
 }
 
 fn require_account() -> Result<cloud::Account> {
