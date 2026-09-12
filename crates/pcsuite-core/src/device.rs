@@ -199,7 +199,7 @@ mod tests {
                 "availableStorage": "327.55",
                 "availableByte": 327_553_000_000u64,
                 "vivoAccount": "138****000",
-                "openid": "66ee212fde7a06a1"
+                "openid": "0123456789abcdef"
             }
         });
         let d = parse_base_info(&reply);
@@ -210,7 +210,7 @@ mod tests {
         assert_eq!(d.product, "PD2505");
         assert_eq!(d.width_pixels, 1440);
         assert!(!d.fold_screen);
-        assert_eq!(d.open_id, "66ee212fde7a06a1");
+        assert_eq!(d.open_id, "0123456789abcdef");
         assert_eq!(d.vivo_account, "138****000");
     }
 
