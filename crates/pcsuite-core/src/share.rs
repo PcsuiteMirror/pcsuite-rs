@@ -912,7 +912,7 @@ fn safe_basename(name: &str) -> Option<String> {
 }
 
 /// `dir/name`, or `dir/stem (N).ext` when already taken (N counting up).
-fn dedup_path(dir: &str, name: &str) -> String {
+pub(crate) fn dedup_path(dir: &str, name: &str) -> String {
     let first = format!("{dir}/{name}");
     if !std::path::Path::new(&first).exists() {
         return first;

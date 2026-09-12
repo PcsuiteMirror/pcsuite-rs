@@ -48,7 +48,7 @@ const SOURCE_PC: &str = "2";
 
 /// `version` header — the client version the cloud expects to see. Kept at the
 /// official build we captured; the API rejects implausibly old values.
-const CLIENT_VERSION: &str = "6.6.0.0";
+pub(crate) const CLIENT_VERSION: &str = "6.6.0.0";
 
 /// `type` field in a device report: 3 = PC.
 const DEVICE_TYPE_PC: i64 = 3;
@@ -81,6 +81,17 @@ impl Account {
     /// still valid — only the server can say that.
     pub fn is_complete(&self) -> bool {
         !self.open_id.is_empty() && !self.token.is_empty()
+    }
+
+    /// When the token was issued, in epoch milliseconds, read from the `.<millis>`
+    /// suffix the account service appends to it.
+    ///
+    /// Only a hint: it says when the login happened, not how long the server is
+    /// willing to honour it. Worth showing because the two servers we talk to
+    /// disagree about staleness — the connection center keeps answering with a
+    /// token the cloud-transfer relay already rejects as expired.
+    pub fn token_issued_at(&self) -> Option<i64> {
+        self.token.rsplit_once('.')?.1.parse().ok()
     }
 }
 

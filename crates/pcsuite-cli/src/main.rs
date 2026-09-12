@@ -23,7 +23,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use pcsuite_core::{
-    cloud, config, device, mdfs, pair, presence_once, register, run_clipboard, run_notify,
+    cloud, cloudshare, config, device, mdfs, pair, presence_once, register, run_clipboard,
+    run_notify,
     run_verify, usb, ClipboardBackend, ClipboardConfig, ConnectAnswer, ListKind, NotifyConfig,
     PresenceConfig,
     RegisterConfig, Registration, Screen, ScreenParams, Session, UsbConfig, VerifyConfig,
@@ -63,10 +64,16 @@ struct Args {
     /// `cloud login` credentials (from the app's QR login, or a captured session).
     open_id: Option<String>,
     token: Option<String>,
+    /// Account region (`hk`, `sg`, `de`, …). Decides which cloud-transfer relay
+    /// host is used; `cloud login` stores it, other `cloud` commands override it
+    /// for one run.
+    country: Option<String>,
     /// `cloud register` probe: publish this push clientId instead of the stored one.
     push_client_id: Option<String>,
     /// `cloud events` probe: fetch one event by id (omit to try enumerating).
     event_id: Option<String>,
+    /// `cloud recv`: receive only this transfer instead of everything waiting.
+    task: Option<String>,
     /// `cloud presence` / connect: per-IP stored seed (connectType=2); else read
     /// from the phone's published `ext.seeds`, then config.
     seed: Option<String>,
@@ -99,8 +106,10 @@ fn parse_args() -> Args {
         sub: None,
         open_id: None,
         token: None,
+        country: None,
         push_client_id: None,
         event_id: None,
+        task: None,
         seed: None,
     };
     let mut i = 1;
@@ -160,6 +169,14 @@ fn parse_args() -> Args {
                 i += 1;
                 a.token = raw.get(i).cloned();
             }
+            "--country" => {
+                i += 1;
+                a.country = raw.get(i).cloned();
+            }
+            "--task" => {
+                i += 1;
+                a.task = raw.get(i).cloned();
+            }
             "--push-client-id" => {
                 i += 1;
                 a.push_client_id = raw.get(i).cloned();
@@ -206,9 +223,13 @@ fn print_help() {
          pcsuite share-recv [--out <本地目录>]   (互传/EasyShare 接收：独立 10191 监听，无需连接会话)\n  \
          pcsuite all (--usb | --phone <IP> [--remote]) [--screen|--clipboard|--verify|--notify] \
          [--seconds <N>] [--out <f>]\n  \
-         pcsuite cloud status|login|register|presence|devices|events|logout   (vivo 账号模式)\n  \
+         pcsuite cloud status|login|region|register|presence|transfers|recv|devices|events|logout\n  \
+         \x20    (vivo 账号模式)\n  \
          pcsuite cloud presence [--phone <IP>] [--seed <SEED>] [--remote]   (保持在线, 手机显示「可连」; 先 register)\n  \
-         pcsuite cloud login --open-id <ID> --token <TOKEN>   (凭据来自 app 的扫码登录)\n\
+         pcsuite cloud login --open-id <ID> --token <TOKEN>   (凭据来自 app 的扫码登录)\n  \
+         pcsuite cloud transfers [--country <代码>]   (云传输: 列出等本机接收的文件)\n  \
+         pcsuite cloud recv [--out <本地目录>] [--task <taskId>] [--seconds <N> 轮询间隔]   (云传输: 下载并回执)\n  \
+         pcsuite cloud region --country <代码>   (账号区域, 决定云传输中转服务器: hk/sg/de/in/br…)\n\
          \x20                                       (clipboard+verify+notify in the background; type\n\
          \x20                                        `screen on`/`screen off` at the prompt to\n\
          \x20                                        toggle mirroring. --screen starts it on.)\n\n\
@@ -1104,10 +1125,14 @@ async fn cmd_cloud(args: Args) -> Result<()> {
                      the CLI cannot show the login page itself."
                 );
             };
-            let acc = cloud::Account::new(open_id, token);
+            let mut acc = cloud::Account::new(open_id, token);
+            if let Some(cc) = args.country.clone() {
+                acc.country_code = cc;
+            }
             cloud::save_account(&acc)?;
             println!("✅ 已保存账号凭据 → {}", show_account_path());
             println!("   openId  {}", acc.open_id);
+            println!("   区域    {}  (用 --country 改)", acc.country_code);
             println!("   本机 deviceId {}", cloud::pc_device_id()?);
             println!("   下一步: pcsuite cloud register");
             Ok(())
@@ -1124,7 +1149,21 @@ async fn cmd_cloud(args: Args) -> Result<()> {
             println!("clipPcId    {}  (deviceId 前 6 位)", cloud::derived_clip_pc_id()?);
             println!("本机 LAN IP {}", cloud::local_ipv4s().join(", "));
             match cloud::load_account() {
-                Some(a) => println!("账号        已登录 openId={}", a.open_id),
+                Some(a) => {
+                    println!("账号        已登录 openId={}", a.open_id);
+                    // The region decides which relay host cloud transfer talks
+                    // to; a wrong one looks like an auth failure, so show it.
+                    println!("区域        {}", a.country_code);
+                    println!("云传输中转  {}", cloudshare::bridge_host(&a.country_code));
+                    if let Some(ms) = a.token_issued_at() {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as i64)
+                            .unwrap_or(0);
+                        let age_days = (now - ms) as f64 / 86_400_000.0;
+                        println!("token 签发  约 {age_days:.1} 天前");
+                    }
+                }
                 None => println!("账号        未登录  (先跑 pcsuite cloud login)"),
             }
             Ok(())
@@ -1185,14 +1224,143 @@ async fn cmd_cloud(args: Args) -> Result<()> {
             println!("      上面列出的 seed 可写进 pcsuite.json 的 \"seeds\"(connectType=2)");
             Ok(())
         }
+        "region" => {
+            let Some(cc) = args.country.clone() else {
+                anyhow::bail!("cloud region needs --country <代码>，例如 --country hk");
+            };
+            let mut acc = require_account()?;
+            acc.country_code = cc;
+            cloud::save_account(&acc)?;
+            println!("✅ 区域已设为 {}", acc.country_code);
+            println!("   云传输中转 {}", cloudshare::bridge_host(&acc.country_code));
+            Ok(())
+        }
+        "transfers" => cmd_cloud_transfers(&args).await,
+        "recv" => cmd_cloud_recv(&args).await,
         other => {
             anyhow::bail!(
                 "unknown cloud subcommand: {other} \
-                 (status|login|register|presence|devices|events|logout)"
+                 (status|login|register|presence|transfers|recv|devices|events|logout)"
             )
         }
     }
 }
+
+/// `pcsuite cloud transfers` — what the relay is holding for this PC.
+///
+/// This is the first call worth making after signing in: it exercises the host
+/// choice, all nine auth headers and the signature in one round trip, so a
+/// `code: 0` here means the rest of the cloud API is reachable.
+async fn cmd_cloud_transfers(args: &Args) -> Result<()> {
+    let cs = cloudshare::CloudShare::new(cloud_account_for(args)?)?;
+    println!("中转服务器  {}", cs.host());
+    println!("本机 deviceId {}", cs.device_id());
+
+    let list = cs
+        .records(&[cloudshare::STATUS_PENDING, cloudshare::STATUS_CANCELLED])
+        .await?;
+    if list.is_empty() {
+        println!("\n(中转服务器上没有等待接收的文件)");
+        println!("提示: 在手机上对本机发一次文件 — 设备条目要带「云传输」角标。");
+        return Ok(());
+    }
+    for r in &list {
+        let expired = if r.is_expired() { "  ⚠️ 已过期" } else { "" };
+        let sender = if r.sender.is_empty() { "-" } else { &r.sender };
+        println!(
+            "\n📦 taskId {}{expired}\n   来自 {sender}   {} 个文件   {}\n   首个文件 {}",
+            r.task_id,
+            r.total_count,
+            human_size(r.total_size),
+            r.first_file_name
+        );
+    }
+    println!("\n下一步: pcsuite cloud recv   (下载全部未过期的传输)");
+    Ok(())
+}
+
+/// `pcsuite cloud recv` — download everything waiting, then acknowledge it.
+///
+/// With `--seconds N` it keeps checking every N seconds instead of running once.
+/// Polling is our own addition: the official client only ever checks when the
+/// user opens its transfer-history page, or when its push daemon pokes it.
+async fn cmd_cloud_recv(args: &Args) -> Result<()> {
+    let out_dir = args.out.clone().unwrap_or_else(default_download_dir);
+    std::fs::create_dir_all(&out_dir).with_context(|| format!("mkdir {out_dir}"))?;
+
+    let cs = cloudshare::CloudShare::new(cloud_account_for(args)?)?;
+    println!("中转服务器  {}", cs.host());
+    println!("保存到      {out_dir}");
+
+    let report = |ev: cloudshare::CloudEvent| match ev {
+        cloudshare::CloudEvent::Started { task_id, files } => {
+            println!("\n📦 开始接收 taskId {task_id} — {} 个文件", files.len());
+        }
+        cloudshare::CloudEvent::FileDone { name, bytes, .. } => {
+            println!("   ✅ {name}  {}", human_size(bytes));
+        }
+        cloudshare::CloudEvent::Done { task_id, files, .. } => {
+            println!("📥 taskId {task_id} 完成, 共 {} 个文件", files.len());
+        }
+        cloudshare::CloudEvent::Failed { task_id, error } => {
+            println!("❌ taskId {task_id} 失败: {error}");
+        }
+    };
+
+    if let Some(task_id) = args.task.clone() {
+        let n = cs.receive_task(&task_id, &out_dir, &report).await?;
+        println!("\n共 {n} 个文件");
+        return Ok(());
+    }
+
+    let Some(interval) = args.seconds else {
+        let n = cs.receive_pending(&out_dir, &report).await?;
+        if n == 0 {
+            println!("\n(没有等待接收的文件)");
+        }
+        return Ok(());
+    };
+
+    let interval = Duration::from_secs_f64(interval.max(1.0));
+    println!("每 {:.0}s 检查一次   Ctrl-C 退出", interval.as_secs_f64());
+    loop {
+        if let Err(e) = cs.receive_pending(&out_dir, &report).await {
+            println!("⚠️  查询失败: {e:#}");
+        }
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => break,
+            _ = tokio::time::sleep(interval) => {}
+        }
+    }
+    Ok(())
+}
+
+/// The signed-in account, with `--country` applied for this run only.
+///
+/// The region is not derivable from the credentials, and picking the wrong one
+/// makes every cloud-transfer call fail against a relay that has never heard of
+/// the account — so it is worth being able to try one without rewriting the
+/// stored file (`cloud region --country <代码>` does that once and for all).
+fn cloud_account_for(args: &Args) -> Result<cloud::Account> {
+    let mut acc = require_account()?;
+    if let Some(cc) = args.country.clone() {
+        acc.country_code = cc;
+    }
+    Ok(acc)
+}
+
+/// Where received files go when `--out` is not given: `~/Downloads` if it
+/// exists, else the working directory.
+fn default_download_dir() -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let dl = format!("{home}/Downloads");
+    if !home.is_empty() && std::path::Path::new(&dl).is_dir() {
+        dl
+    } else {
+        ".".to_string()
+    }
+}
+
 
 /// `pcsuite cloud presence` — hold a 10191 ConnectFlow connection to the phone so
 /// it lists this PC as discoverable ("可连"), reconnecting on drop. This is the

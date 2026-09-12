@@ -79,6 +79,36 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
     h.finalize().into()
 }
 
+/// HMAC-SHA256 (RFC 2104), written out rather than pulling in the `hmac` crate
+/// for one call site. Used by the cloud-transfer API's request signature.
+pub fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    const BLOCK: usize = 64;
+
+    let mut padded = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        padded[..32].copy_from_slice(&sha256(key));
+    } else {
+        padded[..key.len()].copy_from_slice(key);
+    }
+
+    let mut ipad = [0x36u8; BLOCK];
+    let mut opad = [0x5cu8; BLOCK];
+    for (i, b) in padded.iter().enumerate() {
+        ipad[i] ^= b;
+        opad[i] ^= b;
+    }
+
+    let mut inner = Sha256::new();
+    inner.update(ipad);
+    inner.update(msg);
+    let inner = inner.finalize();
+
+    let mut outer = Sha256::new();
+    outer.update(opad);
+    outer.update(inner);
+    outer.finalize().into()
+}
+
 // ───────────────────────────── ConnectFlow sign (AES-256-CBC) ─────────────────────────────
 
 /// `key = SHA256(stored_seed ++ seed_b)`. For the `connectType=1` remote path,
@@ -252,6 +282,25 @@ mod tests {
     // local, untracked fixture and are never committed.
     const STORED: &str = "00000000-0000-4000-8000-000000000000";
     const SEED_B: &str = "11111111-1111-4111-8111-111111111111";
+
+    #[test]
+    fn hmac_sha256_matches_rfc4231() {
+        // RFC 4231 test case 1.
+        assert_eq!(
+            hex::encode(hmac_sha256(&[0x0b; 20], b"Hi There")),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+        // Test case 3 exercises a key exactly one block long after padding.
+        assert_eq!(
+            hex::encode(hmac_sha256(b"Jefe", b"what do ya want for nothing?")),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+        // A key longer than the 64-byte block is hashed down first.
+        assert_eq!(
+            hex::encode(hmac_sha256(&[0xaa; 131], b"Test Using Larger Than Block-Size Key - Hash Key First")),
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+        );
+    }
 
     #[test]
     fn cbc_sign_roundtrip_and_kat() {

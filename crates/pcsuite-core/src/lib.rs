@@ -12,6 +12,7 @@
 pub mod adb;
 pub mod clipboard;
 pub mod cloud;
+pub mod cloudshare;
 pub mod config;
 pub mod connect;
 pub mod device;
