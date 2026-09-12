@@ -70,6 +70,39 @@ pub fn device_info_frame(id: &PcIdentity, code: i64) -> Value {
     })
 }
 
+/// `bytes` code of the immediate acknowledgement the PC owes the phone after a
+/// `bytes:[24]` connect request, and of the frame carrying the outcome. Both are
+/// sent back **on the held presence connection**.
+///
+/// From `DeviceWaitForPreConnect.mobileAskConnectPC` /
+/// `responseDataBuild(cmd:code:reqId:data:length:)` in the official macOS service:
+/// it answers a `[24]` push with `[25]` straight away, runs the connect, then sends
+/// `[27]` with `extra_info = {"retCode":…,"retMsg":…}` (`retCode` 0 = success, the
+/// value the desktop's `ConnectionErrorCodeFO.Success` carries). Without these the
+/// phone times out after ~5s, closes the connection and drops back to 「未发现」 —
+/// which is exactly what we saw while only opening 10380.
+pub const ASK_CONNECT_ACK: i64 = 25;
+pub const ASK_CONNECT_RESULT: i64 = 27;
+
+/// The acknowledgement frame: the standard envelope, `bytes:[25]`, and — per
+/// `responseDataBuild`, which only sets `extra_info` for the `[27]` case — **no
+/// `extra_info` key at all**.
+pub fn ask_connect_ack_frame(id: &PcIdentity) -> Value {
+    device_info_frame(id, ASK_CONNECT_ACK)
+}
+
+/// The outcome frame: `bytes:[27]` plus `extra_info` = `{"retCode","retMsg"}` as a
+/// JSON *string* (the protocol's convention everywhere else too). `ret_code` 0 means
+/// the session came up.
+pub fn ask_connect_result_frame(id: &PcIdentity, ret_code: i64, ret_msg: &str) -> Value {
+    let mut v = device_info_frame(id, ASK_CONNECT_RESULT);
+    let extra = json!({ "retCode": ret_code, "retMsg": ret_msg });
+    v["extra_info"] = Value::String(
+        serde_json::to_string(&extra).expect("retCode/retMsg extra_info serialize"),
+    );
+    v
+}
+
 /// Build the connect frame carrying `seed_b` + `sign`.
 ///
 /// `connect_type`: `2` for LAN (per-IP stored seed), `1` for the remote path
@@ -199,6 +232,27 @@ mod tests {
         assert_eq!(v["type"], 1);
         assert_eq!(v["bytes"][0], 22);
         assert_eq!(v["deviceName"], "test MacBook");
+    }
+
+    #[test]
+    fn ask_connect_ack_carries_no_extra_info() {
+        let v = ask_connect_ack_frame(&id());
+        assert_eq!(v["bytes"][0], 25);
+        // `responseDataBuild` sets extra_info only for the [27] outcome frame.
+        assert!(v.get("extra_info").is_none());
+        assert_eq!(v["target_id"], id().pc_mac); // this PC's MAC, not the phone's id
+        assert_eq!(v["type"], 1);
+        assert_eq!(v["channel"], 0);
+    }
+
+    #[test]
+    fn ask_connect_result_carries_stringified_ret_code() {
+        let v = ask_connect_result_frame(&id(), 0, "success");
+        assert_eq!(v["bytes"][0], 27);
+        let s = v["extra_info"].as_str().expect("extra_info is a string");
+        let extra: serde_json::Value = serde_json::from_str(s).unwrap();
+        assert_eq!(extra["retCode"], 0);
+        assert_eq!(extra["retMsg"], "success");
     }
 
     #[test]

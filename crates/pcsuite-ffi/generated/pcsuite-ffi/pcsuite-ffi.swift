@@ -22,6 +22,9 @@ public func pcsuite_usb_probe() -> RustString {
 public func pcsuite_connect_lan<GenericIntoRustString: IntoRustString>(_ phone_ip: GenericIntoRustString, _ remote: Bool) throws -> PcSession {
     try { let val = __swift_bridge__$pcsuite_connect_lan({ let rustString = phone_ip.intoRustString(); rustString.isOwned = false; return rustString.ptr }(), remote); if val.is_ok { return PcSession(ptr: val.ok_or_err!) } else { throw RustString(ptr: val.ok_or_err!) } }()
 }
+public func pcsuite_connect_lan_token<GenericIntoRustString: IntoRustString>(_ phone_ip: GenericIntoRustString, _ token: GenericIntoRustString) throws -> PcSession {
+    try { let val = __swift_bridge__$pcsuite_connect_lan_token({ let rustString = phone_ip.intoRustString(); rustString.isOwned = false; return rustString.ptr }(), { let rustString = token.intoRustString(); rustString.isOwned = false; return rustString.ptr }()); if val.is_ok { return PcSession(ptr: val.ok_or_err!) } else { throw RustString(ptr: val.ok_or_err!) } }()
+}
 public func pcsuite_cancel_connect() {
     __swift_bridge__$pcsuite_cancel_connect()
 }
@@ -356,8 +359,12 @@ extension PcCloudPresenceRef {
         RustString(ptr: __swift_bridge__$PcCloudPresence$status(ptr))
     }
 
-    public func take_connect_request() -> Bool {
-        __swift_bridge__$PcCloudPresence$take_connect_request(ptr)
+    public func take_connect_request() -> RustString {
+        RustString(ptr: __swift_bridge__$PcCloudPresence$take_connect_request(ptr))
+    }
+
+    public func report_connect_result<GenericIntoRustString: IntoRustString>(_ ret_code: Int64, _ ret_msg: GenericIntoRustString) {
+        __swift_bridge__$PcCloudPresence$report_connect_result(ptr, ret_code, { let rustString = ret_msg.intoRustString(); rustString.isOwned = false; return rustString.ptr }())
     }
 
     public func stop() {

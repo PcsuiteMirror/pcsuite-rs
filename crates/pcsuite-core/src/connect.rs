@@ -12,6 +12,7 @@ use base64::Engine;
 use rand::RngCore;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, Instant};
 
@@ -227,6 +228,32 @@ pub struct PresenceConfig {
     pub stored_seed: Option<String>,
     /// Use the `connectType=1` remote path instead of a pre-shared seed.
     pub remote: bool,
+    /// Announce a connect (`bytes:[0]` + sign, `isAutoConnect:"1"`) as part of the
+    /// *hold*, which is what this code used to do.
+    ///
+    /// The official pre-connect does **not**:
+    /// `DeviceWaitForPreConnect::startPreConnect` is ping → open socket → send
+    /// device_info → recv device_info → parse, and then it just holds the socket
+    /// (`recvMessageAndHeartbeatLoop`). No connect frame, no sign, no seed — the
+    /// `bytes:[0]` frame belongs to `ConnectFlow`, i.e. the *formal* connect.
+    ///
+    /// Announcing a connect at hold time makes the phone believe one is starting: it
+    /// raises a 「正在连接 …」 notification that never completes (observed on a real
+    /// phone; the user has to cancel it before the connection center is usable).
+    /// Kept switchable only to reproduce that.
+    pub connect_frame_on_hold: bool,
+    /// When the phone asks to connect (`bytes:[24]`), send a fresh connect frame
+    /// (`isAutoConnect:"0"`, new token) **on this same held connection** and hand the
+    /// new token to the caller, instead of handing over the token the presence
+    /// handshake registered.
+    ///
+    /// Why in place and never on a second socket: the phone allows one 10191
+    /// connection per PC — opening another closes this one within milliseconds
+    /// (measured), and the `bytes:[25]`/`[27]` answers the phone is waiting for ride
+    /// on *this* connection. The official service's `ConnectFlow` looks the device up
+    /// with `findPreconnectDevice` for exactly that reason ("device is not
+    /// preconnect!" is its complaint when there is nothing to reuse).
+    pub reregister_on_ask: bool,
 }
 
 /// Do the 10191 ConnectFlow handshake, then **hold the connection open** — which
@@ -240,69 +267,113 @@ pub struct PresenceConfig {
 /// Falsified alternatives (do not reintroduce): the discoverable state is NOT
 /// maintained by vpush(MQTT), the `getUserCookie` cloud heartbeat, or SSDP
 /// beacons — only by this held LAN connection (see docs/LAN_DISCOVERY_HANDOFF.md).
-/// Outcome of one [`presence_once`] hold.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PresenceOutcome {
-    /// The phone closed the held connection (roam / idle) — reconnect to keep 可连.
-    Ended,
-    /// The phone tapped 「连接」 (bytes:[24]); the caller should open the 10380
-    /// session with the handed-over token and NOT immediately re-hold presence — a
-    /// presence reconnect would register a fresh token and knock out that session.
-    ConnectRequested,
+/// What the caller made of the phone's connect request, reported back to the phone
+/// on the held connection as `bytes:[27]` `{"retCode","retMsg"}`. `ret_code` 0 means
+/// the session is up (the official desktop's `ConnectionErrorCodeFO.Success`); any
+/// other value tells the phone the connect failed, and presence keeps holding.
+#[derive(Debug, Clone)]
+pub struct ConnectAnswer {
+    pub ret_code: i64,
+    pub ret_msg: String,
 }
 
-pub async fn presence_once<F: FnOnce(), G: Fn(&str)>(
+impl ConnectAnswer {
+    pub fn ok() -> Self {
+        ConnectAnswer { ret_code: 0, ret_msg: "success".into() }
+    }
+
+    pub fn failed(msg: impl Into<String>) -> Self {
+        ConnectAnswer { ret_code: 1, ret_msg: msg.into() }
+    }
+}
+
+/// How long to keep the held connection open waiting for the caller to bring the
+/// session up and report back. The phone gives up in ~5s, so a caller that takes
+/// longer has already lost the round — but keep reading until then rather than
+/// tearing the link down under it.
+const CONNECT_ANSWER_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// A connection id shaped like the official desktop's — `<4 hex>_<epoch ms>`
+/// (Electron `pre-connect-mode`: `${createRandomStr(4)}_${Date.now()}`).
+fn official_conn_id() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("{:04x}_{}", now.subsec_nanos() as u16, now.as_millis())
+}
+
+pub async fn presence_once<F, G>(
     cfg: &PresenceConfig,
     on_ready: F,
     on_connect_request: G,
-) -> Result<PresenceOutcome> {
+) -> Result<()>
+where
+    F: FnOnce(),
+    // Kicks off the connect with the token this connection registered and hands back
+    // a receiver for the outcome, which is reported to the phone as `bytes:[27]`.
+    G: Fn(&str) -> oneshot::Receiver<ConnectAnswer>,
+{
     tracing::info!(phone = %cfg.phone_ip, remote = cfg.remote, "presence: connecting 10191");
     let mut sock = tcp::connect(&cfg.phone_ip, 10191)
         .await
         .context("connect 10191 (phone idle / WiFi off / IP changed?)")?;
 
-    // [1] device-info exchange
+    // [1] device-info exchange — on its own this is the whole official pre-connect.
     let dframe = payload1::encode_json(&connect::device_info_frame(&cfg.identity, 22))?;
     sock.write_all(&dframe).await?;
     sock.flush().await?;
-    if let Some(v) = read_reply(&mut sock, Duration::from_secs(8)).await {
-        tracing::info!(code = ?connect::reply_code(&v), "device_info reply");
-    }
+    let ack = read_reply(&mut sock, Duration::from_secs(8)).await;
+    tracing::info!(
+        code = ?ack.as_ref().and_then(connect::reply_code),
+        auth = ?ack.as_ref().and_then(connect::auth_status),
+        "device_info reply"
+    );
 
-    // [2] connect frame (seed + sign), with the presence auto-connect flags
-    let seed = if cfg.remote {
-        String::new()
-    } else {
-        cfg.stored_seed
-            .clone()
-            .context("presence LAN mode needs a stored seed for this phone IP (or pass remote = true)")?
+    // The sign inputs for whichever connect frame we end up sending. A missing seed
+    // is not fatal any more: it just means the seedless `connectType=1` path.
+    let (connect_type, seed) = match (cfg.remote, cfg.stored_seed.clone()) {
+        (false, Some(s)) => (2, s),
+        (false, None) => {
+            tracing::info!("presence: no stored seed for this phone IP → connectType=1");
+            (1, String::new())
+        }
+        (true, _) => (1, String::new()),
     };
+
+    // [2] Optionally announce a connect while merely holding. Off by default: the
+    // official pre-connect stops after [1], and announcing here leaves the phone with
+    // a 「正在连接 …」 notification it can never finish (see `connect_frame_on_hold`).
     let token = random_token();
-    let conn_id = format!("pcsuite_presence_{}", epoch_secs());
-    let seed_b = uuid::Uuid::new_v4().to_string().to_uppercase();
-    let sign = pcsuite_crypto::make_sign(&cfg.identity.open_id, &conn_id, &token, &seed, &seed_b);
-    let connect_type = if cfg.remote { 1 } else { 2 };
-    let cframe = payload1::encode_json(&connect::connect_frame(
-        &cfg.identity,
-        &seed_b,
-        &sign,
-        connect_type,
-        true,
-        680,
-    ))?;
-    sock.write_all(&cframe).await?;
-    sock.flush().await?;
-    let reply = read_reply(&mut sock, Duration::from_secs(8)).await;
-    let code = reply.as_ref().and_then(connect::reply_code);
-    let auth = reply.as_ref().and_then(connect::auth_status);
-    tracing::info!(?code, ?auth, "presence connect reply");
-    // Presence only needs the connection HELD open — the phone lists this PC as
-    // 「可连」 for as long as it lives, regardless of the connect reply code (an
-    // OpenIdMismatch/Reject on the *connect* step does not un-list us; only the
-    // connection dropping does). So do not bail on the code — just record it and
-    // hold. The code still matters for the actual connect/mirror escalation, which
-    // is a separate ConnectFlow.
-    tracing::info!(?code, ?auth, "presence: holding (any code keeps 可连 while the socket lives)");
+    if cfg.connect_frame_on_hold {
+        let conn_id = format!("pcsuite_presence_{}", epoch_secs());
+        let seed_b = uuid::Uuid::new_v4().to_string().to_uppercase();
+        let sign =
+            pcsuite_crypto::make_sign(&cfg.identity.open_id, &conn_id, &token, &seed, &seed_b);
+        let cframe = payload1::encode_json(&connect::connect_frame(
+            &cfg.identity,
+            &seed_b,
+            &sign,
+            connect_type,
+            true,
+            680,
+        ))?;
+        sock.write_all(&cframe).await?;
+        sock.flush().await?;
+        let reply = read_reply(&mut sock, Duration::from_secs(8)).await;
+        // The reply code does not decide anything: the phone lists this PC as 「可连」
+        // for as long as the connection lives, whatever it answered (an
+        // OpenIdMismatch/Reject on the *connect* step does not un-list us). Only the
+        // connection dropping does.
+        tracing::info!(
+            code = ?reply.as_ref().and_then(connect::reply_code),
+            auth = ?reply.as_ref().and_then(connect::auth_status),
+            "presence connect reply (hold-time announce)"
+        );
+    }
+    tracing::info!(
+        reregister_on_ask = cfg.reregister_on_ask,
+        "presence: holding the connection open = 「可连」"
+    );
 
     on_ready();
 
@@ -310,11 +381,11 @@ pub async fn presence_once<F: FnOnce(), G: Fn(&str)>(
     // the connection lives; it may also push frames here (e.g. when the user taps
     // "connect" on the phone), which we surface for the caller to act on later.
     let mut tmp = [0u8; 8192];
-    loop {
+    'hold: loop {
         match sock.read(&mut tmp).await {
             Ok(0) => {
                 tracing::info!("presence: phone closed the connection (EOF)");
-                return Ok(PresenceOutcome::Ended);
+                return Ok(());
             }
             Ok(n) => {
                 if let Some((v, _)) = payload1::parse_reply_lenient(&tmp[..n]) {
@@ -324,15 +395,97 @@ pub async fn presence_once<F: FnOnce(), G: Fn(&str)>(
                         json = %v,
                         "presence: phone push"
                     );
-                    // `bytes:[24]` = the phone tapped "连接" (wlan_mobile_ask_connect_pc):
-                    // hand the caller THIS held connection's token (the phone already
-                    // opened 10380 for it) so it can open the control session by reusing
-                    // this connection — then STOP holding presence and return, so a
-                    // reconnect doesn't register a fresh token and knock that session out.
+                    // `bytes:[24]` = the phone tapped "连接" (wlan_mobile_ask_connect_pc).
+                    // The phone then waits for US, on this same connection, to answer —
+                    // `[25]` right away, then `[27]` with `{"retCode","retMsg"}` once the
+                    // session is up (that is all `mobileAskConnectPC` does: ack, ask the
+                    // desktop to connect, report the result). Opening 10380 without
+                    // answering makes the phone give up after ~5s and go back to
+                    // 「未发现」 — measured on a real phone, all three connect variants.
                     if connect::is_connect_request(&v) {
-                        tracing::info!("presence: phone requested connect (bytes:[24])");
-                        on_connect_request(&token);
-                        return Ok(PresenceOutcome::ConnectRequested);
+                        tracing::info!("presence: phone requested connect (bytes:[24]) → ack [25]");
+                        let ack = payload1::encode_json(&connect::ask_connect_ack_frame(
+                            &cfg.identity,
+                        ))?;
+                        sock.write_all(&ack).await?;
+                        sock.flush().await?;
+
+                        // Optionally turn this pre-connect link into a formal connect in
+                        // place: same socket, fresh token/connId/seed_b, and
+                        // `isAutoConnect:"0"` — what the official desktop asks its
+                        // service for (`preconnect_connect`, autoConnect "0") without
+                        // giving up the connection the phone is waiting on.
+                        let session_token = if cfg.reregister_on_ask {
+                            let t = random_token();
+                            let cid = official_conn_id();
+                            let sb = uuid::Uuid::new_v4().to_string().to_uppercase();
+                            let sg = pcsuite_crypto::make_sign(
+                                &cfg.identity.open_id,
+                                &cid,
+                                &t,
+                                &seed,
+                                &sb,
+                            );
+                            let f = payload1::encode_json(&connect::connect_frame(
+                                &cfg.identity,
+                                &sb,
+                                &sg,
+                                connect_type,
+                                false,
+                                620,
+                            ))?;
+                            sock.write_all(&f).await?;
+                            sock.flush().await?;
+                            let code = read_reply(&mut sock, Duration::from_secs(8))
+                                .await
+                                .and_then(|v| connect::reply_code(&v));
+                            tracing::info!(?code, "presence: re-registered in place (bytes:[0])");
+                            t
+                        } else {
+                            token.clone()
+                        };
+
+                        // Bring the session up while this connection stays open, then
+                        // tell the phone how it went.
+                        let mut rx = on_connect_request(&session_token);
+                        let deadline = tokio::time::sleep(CONNECT_ANSWER_TIMEOUT);
+                        tokio::pin!(deadline);
+                        let answer = loop {
+                            tokio::select! {
+                                r = &mut rx => break r.ok(),
+                                _ = &mut deadline => {
+                                    tracing::warn!("presence: no connect answer in time");
+                                    break None;
+                                }
+                                read = sock.read(&mut tmp) => match read {
+                                    // The phone hung up before we could answer.
+                                    Ok(0) => return Ok(()),
+                                    Ok(_) => continue,   // ignore further pushes meanwhile
+                                    Err(e) => return Err(e).context("presence read (connecting)"),
+                                },
+                            }
+                        };
+                        let Some(answer) = answer else {
+                            continue 'hold;
+                        };
+                        tracing::info!(
+                            ret_code = answer.ret_code,
+                            ret_msg = %answer.ret_msg,
+                            "presence: reporting connect result [27]"
+                        );
+                        let res = payload1::encode_json(&connect::ask_connect_result_frame(
+                            &cfg.identity,
+                            answer.ret_code,
+                            &answer.ret_msg,
+                        ))?;
+                        sock.write_all(&res).await?;
+                        sock.flush().await?;
+                        // Keep holding either way — this connection *is* how the phone
+                        // sees this PC. Dropping it after a successful connect puts the
+                        // device straight back to 「未发现」 even with the 10380 session
+                        // up (measured); the phone only ever un-lists us when the
+                        // connection goes away.
+                        continue 'hold;
                     }
                 } else {
                     tracing::info!(

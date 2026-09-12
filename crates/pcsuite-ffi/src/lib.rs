@@ -26,7 +26,8 @@ use std::sync::OnceLock;
 use tokio::runtime::Runtime;
 
 use pcsuite_core::{
-    cloud, config, pair, presence_once, register, usb, ClipboardConfig, DeadReason, InputHandle,
+    cloud, config, pair, presence_once, register, usb, ClipboardConfig, ConnectAnswer, DeadReason,
+    InputHandle,
     MouseAction, MouseButton, PhoneNotify, PresenceConfig, RegisterConfig, Registration,
     ScreenParams, ScreenStream, Session, UsbConfig,
 };
@@ -213,6 +214,11 @@ mod ffi {
         fn pcsuite_usb_probe() -> String;
         // Connect over LAN/Tailscale. remote=true uses connectType=1 (no seed).
         fn pcsuite_connect_lan(phone_ip: String, remote: bool) -> Result<PcSession, String>;
+        // Open the session with a token presence already registered (from
+        // PcCloudPresence::take_connect_request) — no ConnectFlow of our own, so the
+        // connection presence is holding stays up. Use this for a phone-initiated
+        // connect; pcsuite_connect_lan is for one we start ourselves.
+        fn pcsuite_connect_lan_token(phone_ip: String, token: String) -> Result<PcSession, String>;
         // Abort an in-flight pcsuite_connect_usb / pcsuite_connect_lan / PcPaired
         // connect() from another thread: it gives up its sockets and returns the
         // error "connect cancelled" right away instead of waiting out the network
@@ -284,11 +290,20 @@ mod ffi {
         // Current state, for the UI to poll: "connecting", "holding" (the phone
         // shows 「可连」), "reconnecting", "error: <why>", or "stopped".
         fn status(&self) -> String;
-        // Poll-and-clear: returns true once after the phone tapped 「连接」 (it
-        // pushed bytes:[24] on the held connection). The app should react by
-        // opening a session (pcsuite_connect_lan) — connect only, no mirror; that
-        // is what the official desktop does. Returns false when nothing is pending.
-        fn take_connect_request(&self) -> bool;
+        // Poll-and-clear: after the phone tapped 「连接」 (it pushed bytes:[24] on the
+        // held connection) this returns the token to open the session with — already
+        // registered on that connection, so open 10380 with it directly via
+        // pcsuite_connect_lan_token and do NOT register again (a second 10191 makes the
+        // phone close the held one). Connect only, no mirror, like the official
+        // desktop. Returns "" when nothing is pending.
+        fn take_connect_request(&self) -> String;
+        // Report how that session went (ret_code 0 = up, anything else = failed with
+        // ret_msg), so presence can answer the phone on the still-held connection
+        // (bytes:[27] {retCode,retMsg}) — the official service's last step. Two rules:
+        // keep this handle alive until you have called it (stopping presence first
+        // closes the connection the answer rides on), and call it promptly — the phone
+        // drops its own request after ~5s and goes back to 「未发现」.
+        fn report_connect_result(&self, ret_code: i64, ret_msg: String);
         // Stop holding the connection (idempotent). The task ends and status
         // becomes "stopped"; the phone reverts to 「未发现」 on its next refresh.
         fn stop(&self);
@@ -1048,9 +1063,16 @@ fn pcsuite_presence_stop() {
 
 // ── 10191 hold-presence (makes the phone list this PC as 「可连」) ──
 
+type AnswerSlot = std::sync::Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<ConnectAnswer>>>>;
+
 pub struct PcCloudPresence {
     status: std::sync::Arc<std::sync::Mutex<String>>,
-    connect_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Set to the session token when the phone asks this PC to connect; the app takes
+    /// it and opens 10380 with it.
+    connect_requested: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// Set while the phone's ask-connect is awaiting its outcome; taking it sends the
+    /// `bytes:[27]` `{retCode,retMsg}` answer on the still-held connection.
+    answer: AnswerSlot,
     stop_tx: tokio::sync::watch::Sender<bool>,
     task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -1059,9 +1081,23 @@ impl PcCloudPresence {
     fn status(&self) -> String {
         self.status.lock().unwrap().clone()
     }
-    fn take_connect_request(&self) -> bool {
-        self.connect_requested
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
+    /// Poll-and-clear: the token to open the session with, or "" when nothing is
+    /// pending. The token is already registered on the held connection, so the app must
+    /// open 10380 with it directly (`pcsuite_connect_lan_token`) and NOT register again.
+    fn take_connect_request(&self) -> String {
+        self.connect_requested.lock().unwrap().take().unwrap_or_default()
+    }
+    /// Report how the session the phone asked for went, so presence can answer it on
+    /// the held connection (`retCode` 0 = up). The phone gives up in ~5s, so call this
+    /// as soon as the connect resolves — and keep this handle alive until then, or the
+    /// answer is never sent and the phone falls back to 「未发现」.
+    fn report_connect_result(&self, ret_code: i64, ret_msg: String) {
+        match self.answer.lock().unwrap().take() {
+            Some(tx) => {
+                let _ = tx.send(ConnectAnswer { ret_code, ret_msg });
+            }
+            None => tracing::warn!("presence: connect result reported with none pending"),
+        }
     }
     fn stop(&self) {
         let _ = self.stop_tx.send(true);
@@ -1082,7 +1118,8 @@ fn pcsuite_cloud_presence_start(phone_ip: String, remote: bool) -> PcCloudPresen
     use std::time::Duration;
 
     let status = Arc::new(Mutex::new("connecting".to_string()));
-    let connect_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let connect_requested: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let answer: AnswerSlot = Arc::new(Mutex::new(None));
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
 
     // The LAN sign must carry the account's openId (the phone rejects a mismatch
@@ -1100,10 +1137,11 @@ fn pcsuite_cloud_presence_start(phone_ip: String, remote: bool) -> PcCloudPresen
     if config::is_pc_mac_placeholder(&identity.pc_mac) {
         *status.lock().unwrap() =
             "error: no businessId (call pcsuite_set_identity / pcsuite_cloud_register first)".into();
-        return PcCloudPresence { status, connect_requested, stop_tx, task: None };
+        return PcCloudPresence { status, connect_requested, answer, stop_tx, task: None };
     }
     let st = status.clone();
     let req_flag = connect_requested.clone();
+    let answer_slot = answer.clone();
     let _guard = rt().enter();
     let task = rt().spawn(async move {
         let mut stop_rx = stop_rx;
@@ -1113,6 +1151,13 @@ fn pcsuite_cloud_presence_start(phone_ip: String, remote: bool) -> PcCloudPresen
             identity,
             stored_seed,
             remote,
+            // Hold exactly like the official pre-connect: device_info exchange only.
+            // Announcing a connect here leaves the phone with a 「正在连接 …」
+            // notification it can never finish.
+            connect_frame_on_hold: false,
+            // Turn the held connection into a formal connect in place when the phone
+            // asks: never a second 10191, which the phone answers by closing this one.
+            reregister_on_ask: true,
         };
 
         let mut backoff = Duration::from_secs(1);
@@ -1123,28 +1168,32 @@ fn pcsuite_cloud_presence_start(phone_ip: String, remote: bool) -> PcCloudPresen
             *st.lock().unwrap() = "connecting".into();
             let st_ready = st.clone();
             let req = req_flag.clone();
+            let ans = answer_slot.clone();
             let once = presence_once(
                 &cfg,
                 move || {
                     *st_ready.lock().unwrap() = "holding".into();
                 },
-                move |_token: &str| {
-                    req.store(true, std::sync::atomic::Ordering::SeqCst);
+                move |token: &str| {
+                    // Park the token and the answer channel for the app: it opens the
+                    // session with this token (no registration of its own — that would
+                    // open a second 10191 and the phone would close the held one), then
+                    // calls report_connect_result, which presence reports to the phone
+                    // as bytes:[27]. Without that answer the phone gives up on its own
+                    // request after ~5s and shows 「未发现」 again.
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    *ans.lock().unwrap() = Some(tx);
+                    *req.lock().unwrap() = Some(token.to_string());
+                    rx
                 },
             );
             tokio::select! {
+                // The hold only ends when the phone closes it (or on error) — an
+                // ask-connect is handled inside, connection kept.
                 r = once => match r {
-                    Ok(pcsuite_core::PresenceOutcome::Ended) => {
+                    Ok(()) => {
                         *st.lock().unwrap() = "reconnecting".into();
                         backoff = Duration::from_secs(1);
-                    }
-                    Ok(pcsuite_core::PresenceOutcome::ConnectRequested) => {
-                        // The phone tapped 「连接」; the flag is set for the app to open
-                        // the session. Stop holding presence — a reconnect here would
-                        // register a fresh token and knock that session out. The app
-                        // restarts a new presence when the session disconnects.
-                        *st.lock().unwrap() = "connect-handoff".into();
-                        break;
                     }
                     Err(e) => *st.lock().unwrap() = format!("error: {e:#}"),
                 },
@@ -1165,6 +1214,7 @@ fn pcsuite_cloud_presence_start(phone_ip: String, remote: bool) -> PcCloudPresen
     PcCloudPresence {
         status,
         connect_requested,
+        answer,
         stop_tx,
         task: Some(task),
     }
@@ -1327,6 +1377,18 @@ async fn resolve_stored_seed(phone_ip: &str, remote: bool) -> Option<String> {
             .or_else(|| d.seeds.values().next())
             .cloned()
     })
+}
+
+/// Open the 10380 session with a token that is **already registered** — the one
+/// `PcCloudPresence::take_connect_request` handed over after the phone asked this PC to
+/// connect. No ConnectFlow of our own: presence registered that token on the connection
+/// it is still holding, and opening a second 10191 would make the phone close that one
+/// (measured: within ~12ms), which also drops the phone's view of this PC to 「未发现」.
+fn pcsuite_connect_lan_token(phone_ip: String, token: String) -> Result<PcSession, String> {
+    let session = block_on_cancellable(async {
+        Ok::<_, anyhow::Error>(Session::connect(&phone_ip, &token).await?)
+    })?;
+    Ok(build_wlan_session(session, token, phone_ip, None))
 }
 
 fn pcsuite_connect_lan(phone_ip: String, remote: bool) -> Result<PcSession, String> {

@@ -24,7 +24,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use pcsuite_core::{
     cloud, config, device, mdfs, pair, presence_once, register, run_clipboard, run_notify,
-    run_verify, usb, ClipboardBackend, ClipboardConfig, ListKind, NotifyConfig, PresenceConfig,
+    run_verify, usb, ClipboardBackend, ClipboardConfig, ConnectAnswer, ListKind, NotifyConfig,
+    PresenceConfig,
     RegisterConfig, Registration, Screen, ScreenParams, Session, UsbConfig, VerifyConfig,
 };
 
@@ -1225,52 +1226,60 @@ async fn cmd_cloud_presence(args: &Args) -> Result<()> {
         }
     };
 
+    // How to hold, and how to answer the phone's 「连接」 tap. Two things were measured
+    // on a real phone and shape these modes:
+    //   * the phone keeps ONE 10191 connection per PC — opening a second one for the
+    //     formal ConnectFlow closes the held one within ~12ms, taking the
+    //     `bytes:[25]`/`[27]` answers with it;
+    //   * announcing a connect while merely holding leaves a 「正在连接 …」 notification
+    //     on the phone that never completes.
+    // So the default reproduces the official service exactly: hold with the device_info
+    // exchange alone, and turn that same connection into a formal connect when asked.
+    //   official (default) — device_info-only hold, connect frame on ask
+    //   hold-connect       — also announce a connect while holding (old behaviour)
+    //   reuse              — announce while holding, then hand that token to the session
+    //   register           — second 10191 connection (known to kill the hold)
+    let ask_mode = std::env::var("PCSUITE_ASK_CONNECT").unwrap_or_else(|_| "official".into());
+    println!("   (presence 模式: {ask_mode})");
     let cfg = PresenceConfig {
         phone_ip: phone_ip.clone(),
         identity,
         stored_seed: seed,
         remote: args.remote,
+        connect_frame_on_hold: ask_mode != "official",
+        reregister_on_ask: matches!(ask_mode.as_str(), "official" | "hold-connect"),
     };
     println!(
         "🟢 presence: 保持 10191 连接到手机 {} (businessId={})，Ctrl+C 停止",
         phone_ip, cfg.identity.pc_mac
     );
 
-    // When the phone taps 「连接」 it pushes bytes:[24] on the held connection; a
-    // worker then opens the 10380 control session (connect only, no mirror), which
-    // is what makes the phone show 「已连接」.
-    //
-    // What the official desktop does here (read out of its own Electron bundle,
-    // `analysis/asar-src/dist/electron/`): the native service forwards the push as
-    // `POST 127.0.0.1:9199/connectDevice {eventId, deviceId}`; the renderer runs
-    // `connectDeviceByDeviceId` → `pre-connect-mode.connectDevice` → native
-    // `preconnect_connect` → `ConnectFlow::start`, i.e. a **fresh, formal
-    // ConnectFlow on a new 10191 socket** (device_info exchange, connect frame with
-    // `isAutoConnect:"0"`, its own token), and only then opens 10380. It does NOT
-    // reuse the pre-connect link's token, and it tears the pre-connect link down
-    // for that device (`DeviceWaitForPreConnect::disconnectPreConnect`) instead of
-    // re-holding it while connected. Reproduce that. `PCSUITE_ASK_CONNECT=reuse`
-    // selects the old token-reuse variant, to A/B the two on a real phone.
-    let reuse_token = std::env::var("PCSUITE_ASK_CONNECT").map(|v| v == "reuse") == Ok(true);
-    let (req_tx, mut req_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    // A session owns the link while this is set: presence must not re-hold then (a
-    // second registration knocks the session out), so the reconnect loop waits on it.
-    let busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let idle_again = Arc::new(tokio::sync::Notify::new());
+    // When the phone taps 「连接」 it pushes bytes:[24] on the held connection.
+    // `presence_once` answers it (`[25]`, then `[27]` with the outcome) and keeps the
+    // connection open throughout — that connection *is* how the phone sees this PC, so
+    // a worker just brings the 10380 control session up with the token from it (connect
+    // only, no mirror) and holds the session object.
+    let second_connection = ask_mode == "register";
+    // Each request carries a one-shot sender for the outcome: `presence_once` keeps
+    // the held connection open and reports it to the phone as `bytes:[27]`.
+    type AskConnect = (String, tokio::sync::oneshot::Sender<ConnectAnswer>);
+    let (req_tx, mut req_rx) = tokio::sync::mpsc::unbounded_channel::<AskConnect>();
     let conn_ip = phone_ip.clone();
     let worker_identity = cfg.identity.clone();
     let worker_seed = cfg.stored_seed.clone();
     let worker_remote = cfg.remote;
-    let worker_busy = busy.clone();
-    let worker_idle = idle_again.clone();
     tokio::spawn(async move {
-        while let Some(token) = req_rx.recv().await {
-            let opened = if reuse_token {
-                println!("📲 手机请求连接 → 复用 presence 的 token 开控制会话(对照组)…");
+        while let Some((token, answer_tx)) = req_rx.recv().await {
+            let opened = if !second_connection {
+                // The token comes from the held connection — either the one presence
+                // registered (mode `reuse`) or the one it just re-registered in place
+                // (mode `inplace`). Either way no new 10191 connection is opened, so the
+                // link stays up to carry the answer.
+                println!("📲 手机请求连接 → 用握手连接上的 token 开控制会话(不新开 10191)…");
                 Session::connect(&conn_ip, &token).await.map(|s| (s, None))
             } else {
                 println!(
-                    "📲 手机请求连接 → 正式 ConnectFlow 注册(官方做法: isAutoConnect=0, connectType={})…",
+                    "📲 手机请求连接 → 另开一条 10191 正式注册(已知会踢掉 presence, 仅对照用: connectType={})…",
                     if worker_remote { 1 } else { 2 }
                 );
                 match register(RegisterConfig {
@@ -1296,8 +1305,11 @@ async fn cmd_cloud_presence(args: &Args) -> Result<()> {
                 // link ends it, then let presence take the link back.
                 Ok((session, _reg)) => {
                     println!(
-                        "   ✅ 已连接 (10380 控制会话)。手机此时应翻成功能按钮;投屏用 `pcsuite screen` 另起。"
+                        "   ✅ 已连接 (10380 控制会话) → 在 presence 连接上回报 retCode=0;手机此时应翻成功能按钮。"
                     );
+                    // Report *before* parking on the session: the phone gives up on the
+                    // ask-connect in ~5s.
+                    let _ = answer_tx.send(ConnectAnswer::ok());
                     let mut dead = session.dead_signal();
                     let reason = loop {
                         let cur = *dead.borrow();
@@ -1310,10 +1322,11 @@ async fn cmd_cloud_presence(args: &Args) -> Result<()> {
                     };
                     println!("   会话结束({reason:?}) → 恢复 presence 保活。");
                 }
-                Err(e) => println!("   控制会话失败: {e:#}"),
+                Err(e) => {
+                    println!("   控制会话失败: {e:#}");
+                    let _ = answer_tx.send(ConnectAnswer::failed(format!("{e:#}")));
+                }
             }
-            worker_busy.store(false, std::sync::atomic::Ordering::SeqCst);
-            worker_idle.notify_waiters();
         }
     });
 
@@ -1322,44 +1335,21 @@ async fn cmd_cloud_presence(args: &Args) -> Result<()> {
         let mut backoff = Duration::from_secs(1);
         loop {
             let req_tx = req_tx.clone();
-            let ask_busy = busy.clone();
             match presence_once(
                 &cfg,
                 || {
                     println!("   ✅ 握手被接受，正在保持连接 = 手机应显示「可连」(断/连 wifi 刷新)");
                 },
                 move |token: &str| {
-                    // Mark the link busy here, not in the worker: `presence_once`
-                    // returns immediately after this callback, so a flag set later
-                    // would let the reconnect loop re-hold presence first and churn.
-                    ask_busy.store(true, std::sync::atomic::Ordering::SeqCst);
-                    let _ = req_tx.send(token.to_string());
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let _ = req_tx.send((token.to_string(), tx));
+                    rx
                 },
             )
             .await
             {
-                Ok(pcsuite_core::PresenceOutcome::Ended) => {
+                Ok(()) => {
                     println!("   连接被手机关闭，1s 后重连…");
-                    backoff = Duration::from_secs(1);
-                }
-                Ok(pcsuite_core::PresenceOutcome::ConnectRequested) => {
-                    // The worker is bringing up the session. Do NOT re-hold presence
-                    // while it lives — a second registration knocks it out (and the
-                    // official service drops its own pre-connect link here too). Wait
-                    // for the worker to report the session gone, then hold again.
-                    println!("   → 手机发起连接,presence 暂停(会话接管);会话结束后自动恢复保活。");
-                    loop {
-                        if !busy.load(std::sync::atomic::Ordering::SeqCst) {
-                            break;
-                        }
-                        // Register interest before re-checking, so a session that ends
-                        // between the check and the await can't be missed.
-                        let woken = idle_again.notified();
-                        if !busy.load(std::sync::atomic::Ordering::SeqCst) {
-                            break;
-                        }
-                        woken.await;
-                    }
                     backoff = Duration::from_secs(1);
                 }
                 Err(e) => {
