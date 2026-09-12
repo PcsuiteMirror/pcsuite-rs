@@ -979,12 +979,14 @@ async fn cmd_recv(args: Args) -> Result<()> {
                     for it in &batch {
                         println!("   {:>9}  {}", human_size(it.size), it.file_name);
                     }
-                    let ok = recv_batch(&t.data_ip, &t.token, &phone.mobile_device_id, &batch, &out_dir).await;
+                    // Same id on both mdfs requests and in the receipt (official behaviour).
+                    let task_id = mdfs::new_transfer_id();
+                    let ok = recv_batch(&t.data_ip, &t.token, &phone.mobile_device_id, &task_id, &batch, &out_dir).await;
                     let receipt = match ok {
-                        Ok(n) => filetrans::success_receipt(batch.len() as u32, n),
+                        Ok(n) => filetrans::success_receipt(&task_id, n),
                         Err(e) => {
                             println!("✗ 接收失败: {e:#}");
-                            filetrans::fail_receipt(batch.len() as u32)
+                            filetrans::fail_receipt(&task_id, batch.len() as u32, 0)
                         }
                     };
                     if let Err(e) = session.control().send(receipt).await {
@@ -1044,12 +1046,13 @@ async fn recv_batch(
     data_ip: &str,
     token: &str,
     device_id: &str,
+    task_id: &str,
     batch: &[pcsuite_core::filetrans::FileTransItem],
     out_dir: &str,
 ) -> Result<u32> {
     let paths: Vec<String> = batch.iter().map(|it| it.path.clone()).collect();
     let total: u64 = batch.iter().map(|it| it.size).sum();
-    let files = mdfs::download_batch(data_ip, token, device_id, &paths, total).await?;
+    let files = mdfs::download_batch(data_ip, token, device_id, task_id, &paths, total).await?;
     let mut written = 0u32;
     for (name, bytes) in &files {
         // Tar entry names come from the phone — keep only the basename.
@@ -1241,7 +1244,7 @@ async fn cmd_cloud_presence(args: &Args) -> Result<()> {
     //   register           — second 10191 connection (known to kill the hold)
     let ask_mode = std::env::var("PCSUITE_ASK_CONNECT").unwrap_or_else(|_| "official".into());
     println!("   (presence 模式: {ask_mode})");
-    let cfg = PresenceConfig {
+    let mut cfg = PresenceConfig {
         phone_ip: phone_ip.clone(),
         identity,
         stored_seed: seed,
@@ -1403,10 +1406,37 @@ async fn cmd_cloud_presence(args: &Args) -> Result<()> {
         }
     });
 
-    // Reconnect loop with backoff; Ctrl+C exits.
+    // Reconnect loop with backoff; Ctrl+C exits. The phone is not always there — it gets
+    // pocketed, leaves the Wi-Fi, comes back on another address — so every retry after the
+    // first re-asks the connection center where it is now (its connectType=2 seed is
+    // per-address, so a stale pair would also break the upgrade).
     let run = async {
         let mut backoff = Duration::from_secs(1);
+        let mut refresh = false;
+        let mut phone_name: Option<String> = None;
         loop {
+            if refresh {
+                match cloud::load_account()
+                    .context("not signed in")
+                    .and_then(cloud::ConnectCenter::new)
+                {
+                    Ok(cc) => match cc.phone_lan_target(phone_name.as_deref()).await {
+                        Ok(t) => {
+                            if t.ip != cfg.phone_ip {
+                                println!("   设备列表新地址: {} → {}", cfg.phone_ip, t.ip);
+                            }
+                            phone_name = Some(t.name);
+                            cfg.phone_ip = t.ip;
+                            if !cfg.remote && args.seed.is_none() {
+                                cfg.stored_seed = t.seed;
+                            }
+                        }
+                        Err(e) => println!("   (设备列表刷新失败: {e:#})"),
+                    },
+                    Err(e) => println!("   (没有可用的连接中心凭据: {e:#})"),
+                }
+            }
+            refresh = true;
             let req_tx = req_tx.clone();
             match presence_once(
                 &cfg,

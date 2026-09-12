@@ -323,6 +323,10 @@ mod ffi {
         // open 10380 with (pcsuite_connect_lan_token); "" = nothing to upgrade, use
         // pcsuite_connect_lan instead. Pair it with report_session_ended when done.
         fn upgrade_for_connect(&self) -> String;
+        // The phone address this hold is aimed at right now — it re-resolves itself when
+        // the phone comes back on another address, so read it instead of remembering what
+        // was passed to pcsuite_cloud_presence_start.
+        fn phone_ip(&self) -> String;
         // Stop holding the connection (idempotent). The task ends and status
         // becomes "stopped"; the phone reverts to 「未发现」 on its next refresh.
         fn stop(&self);
@@ -1155,6 +1159,10 @@ pub struct PcCloudPresence {
     /// Our *own* connects go through here: presence upgrades the connection it is
     /// holding and hands back the token (see `upgrade_for_connect`).
     upgrade_tx: tokio::sync::mpsc::Sender<pcsuite_core::UpgradeRequest>,
+    /// The address this hold is currently aimed at. It changes on its own when the phone
+    /// comes back on a different one, so the app reads it rather than remembering what it
+    /// passed in (it decides whether a connect can ride the hold by comparing addresses).
+    current_ip: std::sync::Arc<std::sync::Mutex<String>>,
     stop_tx: tokio::sync::watch::Sender<bool>,
     task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -1189,6 +1197,12 @@ impl PcCloudPresence {
             }
             None => tracing::warn!("presence: connect result reported with none pending"),
         }
+    }
+
+    /// The phone address this hold is aimed at right now (it re-resolves itself when the
+    /// phone moves).
+    fn phone_ip(&self) -> String {
+        self.current_ip.lock().unwrap().clone()
     }
 
     /// Ask presence to turn the connection it is holding into a formal connect for a
@@ -1256,6 +1270,7 @@ fn pcsuite_cloud_presence_start(phone_ip: String, remote: bool) -> PcCloudPresen
     let connect_requested: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let answer: AnswerSlot = Arc::new(Mutex::new(None));
     let session_ended = Arc::new(Mutex::new(None));
+    let current_ip = Arc::new(Mutex::new(phone_ip.clone()));
     let (upgrade_tx, mut upgrade_rx) = tokio::sync::mpsc::channel::<pcsuite_core::UpgradeRequest>(1);
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
 
@@ -1280,6 +1295,7 @@ fn pcsuite_cloud_presence_start(phone_ip: String, remote: bool) -> PcCloudPresen
             answer,
             session_ended,
             upgrade_tx,
+            current_ip,
             stop_tx,
             task: None,
         };
@@ -1287,11 +1303,15 @@ fn pcsuite_cloud_presence_start(phone_ip: String, remote: bool) -> PcCloudPresen
     let st = status.clone();
     let req_flag = connect_requested.clone();
     let answer_slot = answer.clone();
+    let ip_slot = current_ip.clone();
     let _guard = rt().enter();
     let task = rt().spawn(async move {
         let mut stop_rx = stop_rx;
         let stored_seed = resolve_stored_seed(&phone_ip, remote).await;
-        let cfg = PresenceConfig {
+        // Remember which phone this hold is for, so a retry can ask the connection center
+        // where it is *now* (see `refresh_target`).
+        let mut phone_name: Option<String> = None;
+        let mut cfg = PresenceConfig {
             phone_ip,
             identity,
             stored_seed,
@@ -1306,11 +1326,42 @@ fn pcsuite_cloud_presence_start(phone_ip: String, remote: bool) -> PcCloudPresen
         };
 
         let mut backoff = Duration::from_secs(1);
+        let mut refresh = false;   // the first attempt uses the address we were handed
         loop {
             if *stop_rx.borrow() {
                 break;
             }
             *st.lock().unwrap() = "connecting".into();
+            // A phone that was pocketed / left the Wi-Fi usually comes back on a different
+            // address — and its connectType=2 seed is per-address — so re-ask the
+            // connection center before each retry instead of dialing the address this hold
+            // started with forever. Best-effort: on any error keep the current target.
+            if refresh {
+                match cloud_center() {
+                    Ok(cc) => match cc.phone_lan_target(phone_name.as_deref()).await {
+                        Ok(t) => {
+                            if t.ip != cfg.phone_ip {
+                                tracing::info!(
+                                    from = %cfg.phone_ip,
+                                    to = %t.ip,
+                                    "presence: phone moved → new address"
+                                );
+                            }
+                            phone_name = Some(t.name);
+                            cfg.phone_ip = t.ip;
+                            *ip_slot.lock().unwrap() = cfg.phone_ip.clone();
+                            if !cfg.remote {
+                                // A configured seed still wins (explicit override).
+                                cfg.stored_seed =
+                                    config::default_stored_seed(&cfg.phone_ip).or(t.seed);
+                            }
+                        }
+                        Err(e) => tracing::info!(err = %format!("{e:#}"), "presence: target refresh"),
+                    },
+                    Err(e) => tracing::info!(err = %format!("{e:#}"), "presence: no connect center"),
+                }
+            }
+            refresh = true;   // every attempt after the first re-checks the address
             let st_ready = st.clone();
             let req = req_flag.clone();
             let ans = answer_slot.clone();
@@ -1341,7 +1392,13 @@ fn pcsuite_cloud_presence_start(phone_ip: String, remote: bool) -> PcCloudPresen
                         *st.lock().unwrap() = "reconnecting".into();
                         backoff = Duration::from_secs(1);
                     }
-                    Err(e) => *st.lock().unwrap() = format!("error: {e:#}"),
+                    // Not reachable (pocketed, Wi-Fi off, moved): keep retrying. Say
+                    // "waiting" rather than "error" — the hold is not broken, the phone
+                    // is simply away, and the next attempt re-checks its address.
+                    Err(e) => {
+                        tracing::info!(err = %format!("{e:#}"), "presence: not reachable, will retry");
+                        *st.lock().unwrap() = "waiting".into();
+                    }
                 },
                 _ = stop_rx.changed() => break,
             }
@@ -1363,6 +1420,7 @@ fn pcsuite_cloud_presence_start(phone_ip: String, remote: bool) -> PcCloudPresen
         answer,
         session_ended,
         upgrade_tx,
+        current_ip,
         stop_tx,
         task: Some(task),
     }

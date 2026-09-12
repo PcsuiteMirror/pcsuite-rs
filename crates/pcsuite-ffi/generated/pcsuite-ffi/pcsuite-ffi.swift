@@ -387,6 +387,10 @@ extension PcCloudPresenceRef {
         RustString(ptr: __swift_bridge__$PcCloudPresence$upgrade_for_connect(ptr))
     }
 
+    public func phone_ip() -> RustString {
+        RustString(ptr: __swift_bridge__$PcCloudPresence$phone_ip(ptr))
+    }
+
     public func stop() {
         __swift_bridge__$PcCloudPresence$stop(ptr)
     }

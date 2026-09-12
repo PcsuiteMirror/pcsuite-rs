@@ -199,20 +199,29 @@ pub async fn download(host: &str, token: &str, device_id: &str, save_path: &str)
     untar_first(&tar).with_context(|| format!("download tar had no file entry for {save_path}"))
 }
 
-/// Download a whole batch of phone files (phone→PC「快传」flow): registers with a
-/// fresh transfer id and the declared summed size, streams the tar, and extracts
-/// **every** entry as `(tar entry name, bytes)`.
+/// Download a whole batch of phone files (phone→PC「快传」flow): registers under
+/// the caller's transfer `id` with the declared summed size, streams the tar, and
+/// extracts **every** entry as `(tar entry name, bytes)`. The official client
+/// echoes the same `id` in the `TRANS_FILE_SUCCESS:`/`TRANS_FILE_CANCEL:` receipt,
+/// so the caller mints it (see [`new_transfer_id`]) and keeps it.
 pub async fn download_batch(
     host: &str,
     token: &str,
     device_id: &str,
+    id: &str,
     paths: &[String],
     total: u64,
 ) -> Result<Vec<(String, Vec<u8>)>> {
-    let id = uuid::Uuid::new_v4().to_string();
     let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
-    let tar = download_tar(host, token, device_id, &id, &refs, total).await?;
+    let tar = download_tar(host, token, device_id, id, &refs, total).await?;
     untar_all(&tar)
+}
+
+/// Mint a transfer id for one `download_info`/`download` pair. The official
+/// client uses a cuid; the phone only needs it unique and identical on both
+/// requests (and in the receipt), so a v4 UUID is fine.
+pub fn new_transfer_id() -> String {
+    uuid::Uuid::new_v4().to_string()
 }
 
 /// The two-step mdfs download (`download_info` + `download`), returning the raw
@@ -226,10 +235,16 @@ pub async fn download_tar(
     paths: &[&str],
     total: u64,
 ) -> Result<Vec<u8>> {
+    // Body verbatim from the official Windows client (2026-09-12 log); the four
+    // trailing keys are constant for a plain file batch.
     let info = json!({
         "downloadList": paths,
         "type": "FROM_PC_FILE_MANAGER",
         "total": total,
+        "isDir": false,
+        "isAlbum": false,
+        "albumList": [],
+        "dirList": [],
     });
     let (st, resp) = http_request(
         host,

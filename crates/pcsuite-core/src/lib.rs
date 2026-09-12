@@ -29,7 +29,7 @@ pub mod verify;
 pub mod wsconn;
 
 pub use clipboard::{run_clipboard, ClipboardBackend, ClipboardConfig};
-pub use cloud::{Account, CloudDevice, ConnectCenter};
+pub use cloud::{Account, CloudDevice, ConnectCenter, PhoneTarget};
 pub use connect::{
     presence_once, register, ConnectAnswer, PresenceConfig, RegisterConfig, Registration,
     UpgradeRequest,

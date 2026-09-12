@@ -182,6 +182,42 @@ impl CloudDevice {
     pub fn is_phone(&self) -> bool {
         self.device_type != DEVICE_TYPE_PC
     }
+
+    /// The LAN address to dial for this device *right now*: one sharing a /24 with a
+    /// local address wins, because the list also carries addresses the device reported
+    /// on other networks (a phone that roamed keeps a `192.168.1.x` entry while we are
+    /// on `192.168.31.x`). Falls back to the first address it reported.
+    pub fn reachable_ip(&self) -> Option<String> {
+        let locals: Vec<String> = local_ipv4s().iter().filter_map(|s| subnet24(s)).collect();
+        self.inets
+            .iter()
+            .find(|ip| subnet24(ip).map(|s| locals.contains(&s)).unwrap_or(false))
+            .or_else(|| self.inets.first())
+            .cloned()
+    }
+
+    /// The `connectType=2` seed the phone published for `ip` (its seeds are per-IP), or
+    /// any it published if that address has none.
+    pub fn seed_for(&self, ip: &str) -> Option<String> {
+        self.seeds.get(ip).or_else(|| self.seeds.values().next()).cloned()
+    }
+}
+
+/// The `a.b.c` /24 prefix of a dotted IPv4.
+fn subnet24(ip: &str) -> Option<String> {
+    let mut it = ip.split('.');
+    let (a, b, c) = (it.next()?, it.next()?, it.next()?);
+    it.next()?; // require a 4th octet
+    Some(format!("{a}.{b}.{c}"))
+}
+
+/// Where to reach the account's phone on the LAN, as the connection center reports it.
+#[derive(Debug, Clone)]
+pub struct PhoneTarget {
+    pub name: String,
+    pub ip: String,
+    /// Per-IP `connectType=2` seed, when the phone published one for this address.
+    pub seed: Option<String>,
 }
 
 /// This PC's cloud device id: `SHA256(platform UUID)` + hardware serial.
@@ -394,6 +430,33 @@ impl ConnectCenter {
     pub async fn device_list(&self) -> Result<Vec<CloudDevice>> {
         let v = self.call("GET", "/device/list", None).await?;
         Ok(parse_device_list(&v))
+    }
+
+    /// Where to reach the account's phone on the LAN right now — its current address and
+    /// the seed that goes with it.
+    ///
+    /// Worth re-asking rather than remembering: a phone that leaves and comes back
+    /// (pocketed, Wi-Fi off, another network) usually returns on a different address, and
+    /// its `connectType=2` seed is **per address** — so a presence hold that keeps dialing
+    /// the address it started with never recovers, and an upgrade signed with the old
+    /// seed is rejected. Prefers a phone whose name matches `prefer_name` when the account
+    /// has several.
+    pub async fn phone_lan_target(&self, prefer_name: Option<&str>) -> Result<PhoneTarget> {
+        let list = self.device_list().await?;
+        let phones: Vec<&CloudDevice> = list.iter().filter(|d| d.is_phone()).collect();
+        let phone = prefer_name
+            .and_then(|n| phones.iter().find(|d| d.name == n).copied())
+            .or_else(|| phones.first().copied())
+            .context("account has no phone in its device list")?;
+        let ip = phone
+            .reachable_ip()
+            .filter(|ip| !ip.is_empty())
+            .context("the phone has not reported a LAN address")?;
+        Ok(PhoneTarget {
+            name: phone.name.clone(),
+            seed: phone.seed_for(&ip),
+            ip,
+        })
     }
 
     /// Remove this PC from the account.

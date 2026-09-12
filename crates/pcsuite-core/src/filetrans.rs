@@ -93,13 +93,16 @@ where
             continue;
         }
         let names: Vec<String> = batch.iter().map(|it| it.file_name.clone()).collect();
-        tracing::info!(files = batch.len(), "★ file-transfer batch announced");
+        // One transfer id per batch: used on both mdfs requests and echoed in the
+        // receipt, exactly like the official client.
+        let task_id = mdfs::new_transfer_id();
+        tracing::info!(files = batch.len(), task = %task_id, "★ file-transfer batch announced");
         on_event(FileTransEvent::Started {
             files: names.clone(),
         });
-        match recv_batch(&cfg, &batch).await {
+        match recv_batch(&cfg, &task_id, &batch).await {
             Ok(saved) => {
-                let receipt = success_receipt(batch.len() as u32, saved.len() as u32);
+                let receipt = success_receipt(&task_id, saved.len() as u32);
                 if let Err(e) = control.send(receipt).await {
                     tracing::warn!(err = %e, "file-transfer: receipt send failed");
                 }
@@ -111,7 +114,8 @@ where
             Err(e) => {
                 let error = format!("{e:#}");
                 tracing::warn!(err = %error, "file-transfer: batch failed");
-                if let Err(e2) = control.send(fail_receipt(batch.len() as u32)).await {
+                let receipt = fail_receipt(&task_id, batch.len() as u32, 0);
+                if let Err(e2) = control.send(receipt).await {
                     tracing::warn!(err = %e2, "file-transfer: fail receipt send failed");
                 }
                 on_event(FileTransEvent::Failed {
@@ -125,11 +129,17 @@ where
 
 /// Pull one announced batch over mdfs and write every tar entry into
 /// `cfg.save_dir`. Returns the basenames actually written.
-async fn recv_batch(cfg: &FileTransConfig, batch: &[FileTransItem]) -> Result<Vec<String>> {
+async fn recv_batch(
+    cfg: &FileTransConfig,
+    task_id: &str,
+    batch: &[FileTransItem],
+) -> Result<Vec<String>> {
     std::fs::create_dir_all(&cfg.save_dir).with_context(|| format!("mkdir {}", cfg.save_dir))?;
     let paths: Vec<String> = batch.iter().map(|it| it.path.clone()).collect();
     let total: u64 = batch.iter().map(|it| it.size).sum();
-    let files = mdfs::download_batch(&cfg.data_ip, &cfg.token, &cfg.device_id, &paths, total).await?;
+    let files =
+        mdfs::download_batch(&cfg.data_ip, &cfg.token, &cfg.device_id, task_id, &paths, total)
+            .await?;
     let mut saved = Vec::with_capacity(files.len());
     for (name, bytes) in &files {
         // Tar entry names come from the phone — keep only the basename.
