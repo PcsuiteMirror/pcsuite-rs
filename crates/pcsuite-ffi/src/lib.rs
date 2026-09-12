@@ -1386,6 +1386,8 @@ async fn resolve_stored_seed(phone_ip: &str, remote: bool) -> Option<String> {
 /// (measured: within ~12ms), which also drops the phone's view of this PC to 「未发现」.
 fn pcsuite_connect_lan_token(phone_ip: String, token: String) -> Result<PcSession, String> {
     let session = block_on_cancellable(async {
+        // Official parity: /version + /base-info before the WS.
+        pcsuite_core::pre_ws_probe(&phone_ip, &token, "pcsuite_ask_connect").await;
         Ok::<_, anyhow::Error>(Session::connect(&phone_ip, &token).await?)
     })?;
     Ok(build_wlan_session(session, token, phone_ip, None))

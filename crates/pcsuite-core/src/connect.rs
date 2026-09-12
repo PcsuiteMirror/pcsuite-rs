@@ -416,9 +416,31 @@ where
                         // service for (`preconnect_connect`, autoConnect "0") without
                         // giving up the connection the phone is waiting on.
                         let session_token = if cfg.reregister_on_ask {
+                            // `ConnectFlow::start` re-runs the device_info exchange on
+                            // this same channel *before* the connect frame — its
+                            // `connection_steps` spell it out:
+                            // `_PFD:0_WSR:0_WRR:0_WSR:0_WRR:0_WPR:0` = find preconnect
+                            // device, send/recv twice, parse reply (official Windows
+                            // log, 2026-09-12). Skipping it leaves the phone waiting:
+                            // it shows 「正在连接」 and then 「连接失败」 even though the
+                            // 10380 session is up.
+                            let d = payload1::encode_json(&connect::device_info_frame(
+                                &cfg.identity,
+                                22,
+                            ))?;
+                            sock.write_all(&d).await?;
+                            sock.flush().await?;
+                            let re_ack = read_reply(&mut sock, Duration::from_secs(8)).await;
+                            tracing::info!(
+                                code = ?re_ack.as_ref().and_then(connect::reply_code),
+                                auth = ?re_ack.as_ref().and_then(connect::auth_status),
+                                "presence: connect device_info reply"
+                            );
                             let t = random_token();
                             let cid = official_conn_id();
-                            let sb = uuid::Uuid::new_v4().to_string().to_uppercase();
+                            // Lowercase, like the official `seed` (it is part of the
+                            // sign key, so both sides just need the same string).
+                            let sb = uuid::Uuid::new_v4().to_string();
                             let sg = pcsuite_crypto::make_sign(
                                 &cfg.identity.open_id,
                                 &cid,
@@ -426,13 +448,17 @@ where
                                 &seed,
                                 &sb,
                             );
+                            // 680 = what the official formal connect sends here
+                            // (`pcPcsuiteVersion:680` with `isAutoConnect`/
+                            // `isAutoConnectNew` both "0"). `register` keeps 620, the
+                            // value its heavily-exercised mirror path was validated on.
                             let f = payload1::encode_json(&connect::connect_frame(
                                 &cfg.identity,
                                 &sb,
                                 &sg,
                                 connect_type,
                                 false,
-                                620,
+                                680,
                             ))?;
                             sock.write_all(&f).await?;
                             sock.flush().await?;

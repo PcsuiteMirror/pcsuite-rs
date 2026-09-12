@@ -40,7 +40,7 @@ pub use notify::{run_notify, NotifyConfig};
 pub use pair::{qr_url, wait_for_phone, PhoneNotify};
 pub use presence::PresenceBeacon;
 pub use screen::{InputHandle, Screen};
-pub use session::{ControlHandle, DeadReason, ScreenStream, Session};
+pub use session::{pre_ws_probe, ControlHandle, DeadReason, ScreenStream, Session};
 pub use share::{ShareConfig, ShareReceiver};
 pub use usb::{UsbConfig, UsbLink, UsbSession};
 pub use verify::{run_verify, VerifyConfig};

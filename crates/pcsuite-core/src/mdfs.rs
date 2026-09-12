@@ -20,7 +20,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::time::timeout;
+use tokio::time::{timeout, Instant};
 
 /// The phone connection server port (control WS + this HTTP API).
 pub const CONTROL_PORT: u16 = 10380;
@@ -135,6 +135,34 @@ pub async fn get_path(host: &str, token: &str, device_id: &str, id: &str) -> Res
         .and_then(|s| s.as_str())
         .unwrap_or_default()
         .to_string())
+}
+
+/// `POST /version` on the control HTTP plane, returning the raw body (the phone
+/// answers `0000` when its side is ready).
+///
+/// This is the official desktop's `checkVersion` — the *first* thing it does with a
+/// new session, before `/base-info` and before opening the control WS (three retries,
+/// the third through its own service proxy). The USB path has always done it; the LAN
+/// path skipped it, which leaves the phone's own app short of the handshake it expects
+/// after it asked this PC to connect.
+pub async fn post_version(host: &str, token: &str, body: &Value) -> Result<String> {
+    let payload = serde_json::to_vec(body)?;
+    let (status, resp) = http_request(
+        host,
+        CONTROL_PORT,
+        "POST",
+        "/version",
+        token,
+        "",
+        Some(&payload),
+        IO_TIMEOUT,
+    )
+    .await?;
+    let text = String::from_utf8_lossy(&resp).trim().to_string();
+    if status != 200 {
+        bail!("/version -> HTTP {status}: {}", text.chars().take(160).collect::<String>());
+    }
+    Ok(text)
 }
 
 /// POST a JSON body to a `/pc_file_manager/*` route and parse the JSON reply.
@@ -576,9 +604,49 @@ async fn http_request(
     }
     s.flush().await?;
 
+    // Read until the reply is *complete* rather than until the socket closes: the
+    // phone keeps these connections alive despite `Connection: close`, so waiting for
+    // EOF burns the whole timeout on every call. That cost the phone-initiated connect
+    // its session — `/version` answered in milliseconds but stalled the caller 20s, by
+    // which time the phone had given up and closed 10380.
     let mut buf = Vec::new();
-    let _ = timeout(read_timeout, s.read_to_end(&mut buf)).await;
+    let mut chunk = [0u8; 8192];
+    let deadline = Instant::now() + read_timeout;
+    while !http_reply_complete(&buf) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match timeout(remaining, s.read(&mut chunk)).await {
+            Ok(Ok(0)) => break, // EOF: whatever arrived is all there is
+            Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
+            _ => break,
+        }
+    }
     Ok(parse_http(&buf))
+}
+
+/// Whether `buf` already holds a whole HTTP reply: headers, plus either the
+/// `Content-Length` bytes or a chunked terminator. A reply with neither header (the
+/// phone closes the socket to mark the end) never reads complete, so the caller falls
+/// back to EOF/timeout.
+fn http_reply_complete(buf: &[u8]) -> bool {
+    let Some(sep) = find(buf, b"\r\n\r\n") else {
+        return false;
+    };
+    let head = String::from_utf8_lossy(&buf[..sep]).to_ascii_lowercase();
+    let body_len = buf.len() - (sep + 4);
+    if let Some(len) = head
+        .lines()
+        .find_map(|l| l.strip_prefix("content-length:"))
+        .and_then(|v| v.trim().parse::<usize>().ok())
+    {
+        return body_len >= len;
+    }
+    if head.lines().any(|l| l.starts_with("transfer-encoding:") && l.contains("chunked")) {
+        return find(&buf[sep + 4..], b"0\r\n\r\n").is_some();
+    }
+    false
 }
 
 /// Split an HTTP response into `(status, body)`, de-chunking a `Transfer-Encoding:
@@ -755,6 +823,20 @@ fn walk(v: &Value, out: &mut Vec<Entry>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reply_complete_needs_the_whole_body() {
+        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\n";
+        assert!(!http_reply_complete(head));
+        assert!(!http_reply_complete(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\n{\"a\":"));
+        assert!(http_reply_complete(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\n{\"a\":1}"));
+        // chunked: complete only at the terminator
+        let c = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n";
+        assert!(!http_reply_complete(c));
+        assert!(http_reply_complete(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n"));
+        // no length and not chunked → only EOF can end it
+        assert!(!http_reply_complete(b"HTTP/1.1 200 OK\r\n\r\nbody"));
+    }
 
     #[test]
     fn parse_http_status_and_body() {

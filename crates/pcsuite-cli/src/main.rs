@@ -1276,6 +1276,8 @@ async fn cmd_cloud_presence(args: &Args) -> Result<()> {
                 // (mode `inplace`). Either way no new 10191 connection is opened, so the
                 // link stays up to carry the answer.
                 println!("📲 手机请求连接 → 用握手连接上的 token 开控制会话(不新开 10191)…");
+                // Official parity: /version + /base-info before the WS.
+                pcsuite_core::pre_ws_probe(&conn_ip, &token, &official_conn_id()).await;
                 Session::connect(&conn_ip, &token).await.map(|s| (s, None))
             } else {
                 println!(
@@ -1310,6 +1312,16 @@ async fn cmd_cloud_presence(args: &Args) -> Result<()> {
                     // Report *before* parking on the session: the phone gives up on the
                     // ask-connect in ~5s.
                     let _ = answer_tx.send(ConnectAnswer::ok());
+                    // Log what the phone sends on the control WS — this is where a
+                    // phone-initiated action (e.g. tapping 「投屏」 on its device card)
+                    // arrives, and we do not handle any of those yet.
+                    let mut rx = session.control().subscribe();
+                    tokio::spawn(async move {
+                        while let Ok(msg) = rx.recv().await {
+                            let head: String = msg.chars().take(400).collect();
+                            println!("   📥 控制 WS 收到: {head}");
+                        }
+                    });
                     let mut dead = session.dead_signal();
                     let reason = loop {
                         let cur = *dead.borrow();

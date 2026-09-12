@@ -94,6 +94,62 @@ pub async fn announce_pc_name(host: &str, token: &str, pc_name: &str) -> Result<
     Ok(())
 }
 
+/// The `/base-info` the official desktop posts as part of *connecting*
+/// (`websocket-manager.checkBaseInfo`, between `/version` and the control WS), with
+/// its full body — read out of the official bundle and confirmed against a Windows
+/// connect log:
+///
+/// ```text
+/// {pc_name, pcDeviceId, isLogin, openid, pcLoginAccount, isAutoConnect,
+///  pcSystemType, isSupVdfs, token, isPcOsSupportExtScreen, pcBleId}
+/// ```
+///
+/// Two fields matter beyond the name: `isLogin`/`openid` tell the phone this PC is
+/// signed into the same vivo account (the premise of the whole connection-center
+/// flow), and `pcSystemType` is an enum — **"2" for macOS, "1" for Windows** — not
+/// the free-text "mac" the early announce sends. `pcBleId` is the PC's Bluetooth MAC
+/// in colon form, the same value the connection center registers as `businessId`.
+///
+/// Returns the phone's reply (its `/base-info` payload) so callers can reuse the
+/// device facts without a second round trip.
+pub async fn announce_connect_info(
+    host: &str,
+    token: &str,
+    pc_device_id: &str,
+    open_id: &str,
+    pc_mac: &str,
+) -> Result<DeviceInfo> {
+    // 12 hex digits → "a4:b1:c1:06:be:9e"
+    let ble_id = if pc_mac.len() == 12 && pc_mac.chars().all(|c| c.is_ascii_hexdigit()) {
+        pc_mac
+            .to_lowercase()
+            .as_bytes()
+            .chunks(2)
+            .map(|p| String::from_utf8_lossy(p).to_string())
+            .collect::<Vec<_>>()
+            .join(":")
+    } else {
+        pc_mac.to_string()
+    };
+    let body = json!({
+        "pc_name": config::default_identity().device_name,
+        "pcDeviceId": pc_device_id,
+        "isLogin": !open_id.is_empty(),
+        "openid": open_id,
+        "pcLoginAccount": "",
+        "isAutoConnect": false,
+        "pcSystemType": "2",
+        "isSupVdfs": true,
+        "token": token,
+        "isPcOsSupportExtScreen": true,
+        "pcBleId": ble_id,
+    });
+    let reply = mdfs::post_json(host, token, "", "/base-info", &body)
+        .await
+        .context("/base-info (connect)")?;
+    Ok(parse_base_info(&reply))
+}
+
 /// Extract a [`DeviceInfo`] from a `/base-info` reply. Unwraps the `ChannelBean`
 /// envelope (`{code,data,message}`) and tolerates a flat object; missing fields fall
 /// back to defaults.

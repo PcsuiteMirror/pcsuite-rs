@@ -91,6 +91,55 @@ impl Drop for Session {
     }
 }
 
+/// The two control-HTTP calls the official desktop makes on 10380 **before** opening
+/// the control WS — `checkVersion` then `checkBaseInfo` (Electron
+/// `websocket-manager.connect_device2`, confirmed against the official Windows service
+/// log). Best-effort: both are logged and never fatal, since the WS is what carries
+/// the session.
+///
+/// Worth doing for a connect the *phone* asked for: it is waiting for its own app to
+/// see a complete handshake, and `/base-info`'s `pc_name` is also what the phone's
+/// 「已连接 "<PC>"」 card reads.
+pub async fn pre_ws_probe(data_ip: &str, token: &str, conn_id: &str) {
+    let body = serde_json::json!({
+        "version": "6.0.1",
+        "connBaseVersionCode": 3082,
+        "pcSuiteVersionCode": 60011,
+        "timestamp": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0),
+        "connectionId": conn_id,
+        "pcDeviceId": config::clip_pc_id(),
+        "token": token,
+        "isAutoConnect": false,
+    });
+    match crate::mdfs::post_version(data_ip, token, &body).await {
+        Ok(resp) => tracing::info!(resp = %resp.chars().take(80).collect::<String>(), "/version"),
+        Err(e) => tracing::info!(err = %format!("{e:#}"), "/version (best effort)"),
+    }
+    let id = config::default_identity();
+    // The full PC device id when we have one (account mode derives it from the
+    // hardware ids); the clipboard short id is only a fallback.
+    let pc_device_id = crate::cloud::pc_device_id().unwrap_or_else(|_| config::clip_pc_id());
+    match crate::device::announce_connect_info(
+        data_ip,
+        token,
+        &pc_device_id,
+        &id.open_id,
+        &id.pc_mac,
+    )
+    .await
+    {
+        Ok(info) => tracing::info!(
+            phone = %info.mobile_device_name,
+            android = %info.android_version,
+            "/base-info"
+        ),
+        Err(e) => tracing::info!(err = %format!("{e:#}"), "/base-info (best effort)"),
+    }
+}
+
 impl Session {
     /// Open the shared control WS on `data_ip` with `token`.
     pub async fn connect(data_ip: &str, token: &str) -> Result<Session> {
