@@ -1239,22 +1239,81 @@ async fn cmd_cloud_presence(args: &Args) -> Result<()> {
     // When the phone taps 「连接」 it pushes bytes:[24] on the held connection; a
     // worker then opens the 10380 control session (connect only, no mirror), which
     // is what makes the phone show 「已连接」.
+    //
+    // What the official desktop does here (read out of its own Electron bundle,
+    // `analysis/asar-src/dist/electron/`): the native service forwards the push as
+    // `POST 127.0.0.1:9199/connectDevice {eventId, deviceId}`; the renderer runs
+    // `connectDeviceByDeviceId` → `pre-connect-mode.connectDevice` → native
+    // `preconnect_connect` → `ConnectFlow::start`, i.e. a **fresh, formal
+    // ConnectFlow on a new 10191 socket** (device_info exchange, connect frame with
+    // `isAutoConnect:"0"`, its own token), and only then opens 10380. It does NOT
+    // reuse the pre-connect link's token, and it tears the pre-connect link down
+    // for that device (`DeviceWaitForPreConnect::disconnectPreConnect`) instead of
+    // re-holding it while connected. Reproduce that. `PCSUITE_ASK_CONNECT=reuse`
+    // selects the old token-reuse variant, to A/B the two on a real phone.
+    let reuse_token = std::env::var("PCSUITE_ASK_CONNECT").map(|v| v == "reuse") == Ok(true);
     let (req_tx, mut req_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    // A session owns the link while this is set: presence must not re-hold then (a
+    // second registration knocks the session out), so the reconnect loop waits on it.
+    let busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let idle_again = Arc::new(tokio::sync::Notify::new());
     let conn_ip = phone_ip.clone();
+    let worker_identity = cfg.identity.clone();
+    let worker_seed = cfg.stored_seed.clone();
+    let worker_remote = cfg.remote;
+    let worker_busy = busy.clone();
+    let worker_idle = idle_again.clone();
     tokio::spawn(async move {
-        let mut _session: Option<Session> = None;
         while let Some(token) = req_rx.recv().await {
-            println!("📲 手机请求连接 → 用 presence 的 token 开控制会话(复用同一连接, 不投屏)…");
-            // Reuse the token presence already registered on its held 10191
-            // connection — the phone opened 10380 for it — instead of registering a
-            // second 10191 connection. Keep the Session alive so the link persists.
-            match Session::connect(&conn_ip, &token).await {
-                Ok(s) => {
-                    println!("   ✅ 已连接 (10380 控制会话, 复用 presence token)。投屏用 `pcsuite screen` 另起。");
-                    _session = Some(s);
+            let opened = if reuse_token {
+                println!("📲 手机请求连接 → 复用 presence 的 token 开控制会话(对照组)…");
+                Session::connect(&conn_ip, &token).await.map(|s| (s, None))
+            } else {
+                println!(
+                    "📲 手机请求连接 → 正式 ConnectFlow 注册(官方做法: isAutoConnect=0, connectType={})…",
+                    if worker_remote { 1 } else { 2 }
+                );
+                match register(RegisterConfig {
+                    reg_ip: conn_ip.clone(),
+                    identity: worker_identity.clone(),
+                    stored_seed: worker_seed.clone(),
+                    remote: worker_remote,
+                    token: None,
+                    conn_id: Some(official_conn_id()),
+                    presence: false,
+                })
+                .await
+                {
+                    Ok(reg) => {
+                        let t = reg.token.clone();
+                        Session::connect(&conn_ip, &t).await.map(|s| (s, Some(reg)))
+                    }
+                    Err(e) => Err(e),
+                }
+            };
+            match opened {
+                // Hold the session (and its registration) until the phone or the
+                // link ends it, then let presence take the link back.
+                Ok((session, _reg)) => {
+                    println!(
+                        "   ✅ 已连接 (10380 控制会话)。手机此时应翻成功能按钮;投屏用 `pcsuite screen` 另起。"
+                    );
+                    let mut dead = session.dead_signal();
+                    let reason = loop {
+                        let cur = *dead.borrow();
+                        if cur.is_some() {
+                            break cur;
+                        }
+                        if dead.changed().await.is_err() {
+                            break None;
+                        }
+                    };
+                    println!("   会话结束({reason:?}) → 恢复 presence 保活。");
                 }
                 Err(e) => println!("   控制会话失败: {e:#}"),
             }
+            worker_busy.store(false, std::sync::atomic::Ordering::SeqCst);
+            worker_idle.notify_waiters();
         }
     });
 
@@ -1263,12 +1322,17 @@ async fn cmd_cloud_presence(args: &Args) -> Result<()> {
         let mut backoff = Duration::from_secs(1);
         loop {
             let req_tx = req_tx.clone();
+            let ask_busy = busy.clone();
             match presence_once(
                 &cfg,
                 || {
                     println!("   ✅ 握手被接受，正在保持连接 = 手机应显示「可连」(断/连 wifi 刷新)");
                 },
                 move |token: &str| {
+                    // Mark the link busy here, not in the worker: `presence_once`
+                    // returns immediately after this callback, so a flag set later
+                    // would let the reconnect loop re-hold presence first and churn.
+                    ask_busy.store(true, std::sync::atomic::Ordering::SeqCst);
                     let _ = req_tx.send(token.to_string());
                 },
             )
@@ -1279,13 +1343,24 @@ async fn cmd_cloud_presence(args: &Args) -> Result<()> {
                     backoff = Duration::from_secs(1);
                 }
                 Ok(pcsuite_core::PresenceOutcome::ConnectRequested) => {
-                    // The session worker is opening 10380 with this connection's
-                    // token. Do NOT re-hold presence — a fresh register would knock
-                    // that session out. Pause presence while the session lives; the
-                    // phone closing 10191 here is the normal hand-off.
-                    println!("   → 手机发起连接，presence 暂停(会话接管);会话结束后可 Ctrl+C 重来。");
-                    // keep the process alive so the session worker's session persists.
-                    std::future::pending::<()>().await;
+                    // The worker is bringing up the session. Do NOT re-hold presence
+                    // while it lives — a second registration knocks it out (and the
+                    // official service drops its own pre-connect link here too). Wait
+                    // for the worker to report the session gone, then hold again.
+                    println!("   → 手机发起连接,presence 暂停(会话接管);会话结束后自动恢复保活。");
+                    loop {
+                        if !busy.load(std::sync::atomic::Ordering::SeqCst) {
+                            break;
+                        }
+                        // Register interest before re-checking, so a session that ends
+                        // between the check and the await can't be missed.
+                        let woken = idle_again.notified();
+                        if !busy.load(std::sync::atomic::Ordering::SeqCst) {
+                            break;
+                        }
+                        woken.await;
+                    }
+                    backoff = Duration::from_secs(1);
                 }
                 Err(e) => {
                     eprintln!("   presence 断开: {e:#}；{}s 后重连…", backoff.as_secs());
@@ -1304,6 +1379,17 @@ async fn cmd_cloud_presence(args: &Args) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// A connection id shaped like the official desktop's — `<4 hex>_<epoch ms>`, from
+/// Electron `pre-connect-mode`: `${createRandomStr(4)}_${Date.now()}`. It goes into
+/// the sign plaintext (`openId|connId|token`), so matching the shape removes one
+/// more difference between our connect and the official one.
+fn official_conn_id() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("{:04x}_{}", now.subsec_nanos() as u16, now.as_millis())
 }
 
 /// The `a.b.c` /24 prefix of a dotted IPv4, for same-subnet matching.

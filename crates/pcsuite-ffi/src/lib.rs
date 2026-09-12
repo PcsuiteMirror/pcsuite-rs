@@ -1107,27 +1107,7 @@ fn pcsuite_cloud_presence_start(phone_ip: String, remote: bool) -> PcCloudPresen
     let _guard = rt().enter();
     let task = rt().spawn(async move {
         let mut stop_rx = stop_rx;
-        // Resolve the connectType=2 seed: a configured per-IP seed wins; otherwise
-        // read the phone's published `ext.seeds` from the connection center (what
-        // the CLI does), so the app never has to plumb the seed through itself.
-        let stored_seed = if remote {
-            None
-        } else {
-            match config::default_stored_seed(&phone_ip) {
-                Some(s) => Some(s),
-                None => match cloud_center() {
-                    Ok(cc) => cc.device_list().await.ok().and_then(|list| {
-                        list.iter().find(|d| d.is_phone()).and_then(|d| {
-                            d.seeds
-                                .get(&phone_ip)
-                                .or_else(|| d.seeds.values().next())
-                                .cloned()
-                        })
-                    }),
-                    Err(_) => None,
-                },
-            }
-        };
+        let stored_seed = resolve_stored_seed(&phone_ip, remote).await;
         let cfg = PresenceConfig {
             phone_ip,
             identity,
@@ -1322,13 +1302,46 @@ fn pcsuite_connect_usb() -> Result<PcSession, String> {
     })
 }
 
+/// Resolve the `connectType=2` (WLAN) stored seed for one phone IP: a configured
+/// per-IP seed wins, else the phone's own published `ext.seeds` from the connection
+/// center — so the app never has to plumb a seed through itself.
+///
+/// Shared by the presence hold and the LAN connect on purpose: the phone does not
+/// treat the two ConnectFlow types as interchangeable. `connectType=2` is a nearby
+/// WLAN connect; `connectType=1` is the seedless FARAWAYWLAN (remote) path. Falling
+/// back to `remote` just because no seed was configured would register this PC as a
+/// far-away device on its own LAN. `remote = true` (the caller asked for it) needs
+/// no seed.
+async fn resolve_stored_seed(phone_ip: &str, remote: bool) -> Option<String> {
+    if remote {
+        return None;
+    }
+    if let Some(s) = config::default_stored_seed(phone_ip) {
+        return Some(s);
+    }
+    let cc = cloud_center().ok()?;
+    let list = cc.device_list().await.ok()?;
+    list.iter().find(|d| d.is_phone()).and_then(|d| {
+        d.seeds
+            .get(phone_ip)
+            .or_else(|| d.seeds.values().next())
+            .cloned()
+    })
+}
+
 fn pcsuite_connect_lan(phone_ip: String, remote: bool) -> Result<PcSession, String> {
-    let stored_seed = if remote {
-        None
-    } else {
-        config::default_stored_seed(&phone_ip)
-    };
     let (reg, token, session) = block_on_cancellable(async {
+        // `remote = false` means "prefer the nearby WLAN connect": resolve a seed
+        // (config, else the account's device list) and only fall back to the seedless
+        // connectType=1 when there genuinely is none — registering with no seed would
+        // otherwise just fail. The caller no longer has to know whether a seed exists.
+        let stored_seed = resolve_stored_seed(&phone_ip, remote).await;
+        let remote = remote || stored_seed.is_none();
+        tracing::info!(
+            phone = %phone_ip,
+            connect_type = if remote { 1 } else { 2 },
+            "LAN connect"
+        );
         let reg = register(RegisterConfig {
             reg_ip: phone_ip.clone(),
             identity: config::default_identity(),
