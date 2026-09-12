@@ -271,19 +271,33 @@ pub struct PresenceConfig {
 /// on the held connection as `bytes:[27]` `{"retCode","retMsg"}`. `ret_code` 0 means
 /// the session is up (the official desktop's `ConnectionErrorCodeFO.Success`); any
 /// other value tells the phone the connect failed, and presence keeps holding.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ConnectAnswer {
     pub ret_code: i64,
     pub ret_msg: String,
+    /// Fires when that session ends. This connection was *upgraded* into the session's
+    /// formal connect, so holding it afterwards leaves the phone showing the PC as
+    /// connected — with function buttons that do nothing. On this signal the hold is
+    /// dropped and re-established as a fresh pre-connect, which is exactly what the
+    /// official service does (`WlanFarawayDevice::disconnect`: "Disconnect one device
+    /// preconnect"; it sends no frame for it). `None` keeps the old behaviour of holding
+    /// on regardless.
+    pub ended: Option<oneshot::Receiver<()>>,
 }
 
 impl ConnectAnswer {
     pub fn ok() -> Self {
-        ConnectAnswer { ret_code: 0, ret_msg: "success".into() }
+        ConnectAnswer { ret_code: 0, ret_msg: "success".into(), ended: None }
+    }
+
+    /// Success, plus the signal that tells presence when to go back to being merely
+    /// discoverable.
+    pub fn ok_until(ended: oneshot::Receiver<()>) -> Self {
+        ConnectAnswer { ret_code: 0, ret_msg: "success".into(), ended: Some(ended) }
     }
 
     pub fn failed(msg: impl Into<String>) -> Self {
-        ConnectAnswer { ret_code: 1, ret_msg: msg.into() }
+        ConnectAnswer { ret_code: 1, ret_msg: msg.into(), ended: None }
     }
 }
 
@@ -506,11 +520,39 @@ where
                         ))?;
                         sock.write_all(&res).await?;
                         sock.flush().await?;
-                        // Keep holding either way — this connection *is* how the phone
-                        // sees this PC. Dropping it after a successful connect puts the
-                        // device straight back to 「未发现」 even with the 10380 session
-                        // up (measured); the phone only ever un-lists us when the
-                        // connection goes away.
+                        // Keep holding while the session lives — this connection *is*
+                        // how the phone sees this PC. Dropping it right after a
+                        // successful connect puts the device straight back to 「未发现」
+                        // even with the 10380 session up (measured).
+                        if let Some(mut ended) = answer.ended {
+                            loop {
+                                tokio::select! {
+                                    _ = &mut ended => {
+                                        tracing::info!(
+                                            "presence: session ended → drop this (upgraded)                                              connection and re-hold a fresh pre-connect"
+                                        );
+                                        return Ok(());
+                                    }
+                                    read = sock.read(&mut tmp) => match read {
+                                        Ok(0) => return Ok(()),
+                                        Ok(n) => {
+                                            if let Some((v, _)) =
+                                                payload1::parse_reply_lenient(&tmp[..n])
+                                            {
+                                                tracing::info!(
+                                                    code = ?connect::reply_code(&v),
+                                                    json = %v,
+                                                    "presence: phone push (connected)"
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            return Err(e).context("presence read (connected)")
+                                        }
+                                    },
+                                }
+                            }
+                        }
                         continue 'hold;
                     }
                 } else {

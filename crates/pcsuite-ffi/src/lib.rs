@@ -314,6 +314,11 @@ mod ffi {
         // closes the connection the answer rides on), and call it promptly — the phone
         // drops its own request after ~5s and goes back to 「未发现」.
         fn report_connect_result(&self, ret_code: i64, ret_msg: String);
+        // Tell presence that session has ended, so this PC stops being presented as
+        // connected (it drops the connection it upgraded and re-holds a plain
+        // discoverable one). Without this the phone keeps showing 「已连接」 with
+        // function buttons that do nothing. Idempotent.
+        fn report_session_ended(&self);
         // Stop holding the connection (idempotent). The task ends and status
         // becomes "stopped"; the phone reverts to 「未发现」 on its next refresh.
         fn stop(&self);
@@ -1140,6 +1145,9 @@ pub struct PcCloudPresence {
     /// Set while the phone's ask-connect is awaiting its outcome; taking it sends the
     /// `bytes:[27]` `{retCode,retMsg}` answer on the still-held connection.
     answer: AnswerSlot,
+    /// Fired by `report_session_ended`: tells presence that the session it upgraded this
+    /// connection for is over, so it drops it and goes back to a plain discoverable hold.
+    session_ended: std::sync::Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
     stop_tx: tokio::sync::watch::Sender<bool>,
     task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -1161,9 +1169,28 @@ impl PcCloudPresence {
     fn report_connect_result(&self, ret_code: i64, ret_msg: String) {
         match self.answer.lock().unwrap().take() {
             Some(tx) => {
-                let _ = tx.send(ConnectAnswer { ret_code, ret_msg });
+                // On success hand presence a channel for "that session is over", so it
+                // can stop presenting this PC as connected once the session goes away.
+                let ended = if ret_code == 0 {
+                    let (etx, erx) = tokio::sync::oneshot::channel();
+                    *self.session_ended.lock().unwrap() = Some(etx);
+                    Some(erx)
+                } else {
+                    None
+                };
+                let _ = tx.send(ConnectAnswer { ret_code, ret_msg, ended });
             }
             None => tracing::warn!("presence: connect result reported with none pending"),
+        }
+    }
+
+    /// Tell presence the session the phone asked for has ended (disconnected, dropped, or
+    /// the user ended it here). Presence then drops the connection it upgraded and
+    /// re-holds a fresh pre-connect, so the phone goes back to 「可连」 instead of showing
+    /// this PC as connected with dead function buttons. Idempotent.
+    fn report_session_ended(&self) {
+        if let Some(tx) = self.session_ended.lock().unwrap().take() {
+            let _ = tx.send(());
         }
     }
     fn stop(&self) {
@@ -1187,6 +1214,7 @@ fn pcsuite_cloud_presence_start(phone_ip: String, remote: bool) -> PcCloudPresen
     let status = Arc::new(Mutex::new("connecting".to_string()));
     let connect_requested: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let answer: AnswerSlot = Arc::new(Mutex::new(None));
+    let session_ended = Arc::new(Mutex::new(None));
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
 
     // The LAN sign must carry the account's openId (the phone rejects a mismatch
@@ -1204,7 +1232,14 @@ fn pcsuite_cloud_presence_start(phone_ip: String, remote: bool) -> PcCloudPresen
     if config::is_pc_mac_placeholder(&identity.pc_mac) {
         *status.lock().unwrap() =
             "error: no businessId (call pcsuite_set_identity / pcsuite_cloud_register first)".into();
-        return PcCloudPresence { status, connect_requested, answer, stop_tx, task: None };
+        return PcCloudPresence {
+            status,
+            connect_requested,
+            answer,
+            session_ended,
+            stop_tx,
+            task: None,
+        };
     }
     let st = status.clone();
     let req_flag = connect_requested.clone();
@@ -1282,6 +1317,7 @@ fn pcsuite_cloud_presence_start(phone_ip: String, remote: bool) -> PcCloudPresen
         status,
         connect_requested,
         answer,
+        session_ended,
         stop_tx,
         task: Some(task),
     }

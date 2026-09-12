@@ -1310,8 +1310,10 @@ async fn cmd_cloud_presence(args: &Args) -> Result<()> {
                         "   ✅ 已连接 (10380 控制会话) → 在 presence 连接上回报 retCode=0;手机此时应翻成功能按钮。"
                     );
                     // Report *before* parking on the session: the phone gives up on the
-                    // ask-connect in ~5s.
-                    let _ = answer_tx.send(ConnectAnswer::ok());
+                    // ask-connect in ~5s. The `ended` channel tells presence when to stop
+                    // presenting this PC as connected.
+                    let (ended_tx, ended_rx) = tokio::sync::oneshot::channel();
+                    let _ = answer_tx.send(ConnectAnswer::ok_until(ended_rx));
                     // The phone's function buttons arrive here as
                     // `connectCenterMsg:{name,msgId,…}`; 「投屏」 is `openVivoScreen`.
                     // Start the mirror (authority source 2 = the connection center asked,
@@ -1387,7 +1389,11 @@ async fn cmd_cloud_presence(args: &Args) -> Result<()> {
                     if let Some(h) = screen.take() {
                         h.abort();
                     }
-                    println!("   会话结束({reason:?}) → 恢复 presence 保活。");
+                    // Hand presence back: it drops the connection it upgraded for this
+                    // session and re-holds a plain pre-connect, so the phone shows
+                    // 「可连」 again instead of a connected PC with dead buttons.
+                    let _ = ended_tx.send(());
+                    println!("   会话结束({reason:?}) → presence 重新保活(手机回到「可连」)。");
                 }
                 Err(e) => {
                     println!("   控制会话失败: {e:#}");

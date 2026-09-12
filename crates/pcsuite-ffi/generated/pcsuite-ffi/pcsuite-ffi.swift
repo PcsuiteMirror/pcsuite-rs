@@ -379,6 +379,10 @@ extension PcCloudPresenceRef {
         __swift_bridge__$PcCloudPresence$report_connect_result(ptr, ret_code, { let rustString = ret_msg.intoRustString(); rustString.isOwned = false; return rustString.ptr }())
     }
 
+    public func report_session_ended() {
+        __swift_bridge__$PcCloudPresence$report_session_ended(ptr)
+    }
+
     public func stop() {
         __swift_bridge__$PcCloudPresence$stop(ptr)
     }
