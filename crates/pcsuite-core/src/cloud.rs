@@ -398,8 +398,25 @@ impl ConnectCenter {
             .iter()
             .map(|ip| json!({ "inet": ip, "localInet": ip, "netmark": "255.255.255.0", "ssid": "" }))
             .collect();
+        // ── Experiment switch: which OS this PC claims to be ──────────────────
+        // The phone's 互传 picks a transfer path by device type. A Mac-registered
+        // PC becomes ShareDevice type 6, whose branch never serves files itself —
+        // it calls `sendFilesByPCSuite()` and so needs a live pcsuite session. A
+        // Windows-registered PC takes the type 3/4 branch, which is the plain-LAN
+        // flow this crate already implements (see `share.rs`). Setting
+        // `PCSUITE_CLOUD_OS=windows` registers with the official Windows client's
+        // identity values so that path can be tested; anything else (the default)
+        // registers honestly as a Mac.
+        let claim_windows = std::env::var("PCSUITE_CLOUD_OS")
+            .map(|v| v.eq_ignore_ascii_case("windows"))
+            .unwrap_or(false);
+        let (os_name, company, model) = if claim_windows {
+            ("Windows", "LENOVO", "82GL".to_string())
+        } else {
+            ("Mac", "apple", host_model())
+        };
         let mut ext = json!({
-            "deviceType": "Mac",
+            "deviceType": os_name,
             "businessId": pc_mac,
             "pc_pcsuite_version": CLIENT_VERSION,
         });
@@ -407,8 +424,8 @@ impl ConnectCenter {
             "userId": self.account.open_id,
             "deviceId": self.device_id,
             "name": name,
-            "model": host_model(),
-            "company": "apple",
+            "model": model,
+            "company": company,
             "type": DEVICE_TYPE_PC,
             "inets": inets,
             "bizInfo": { "office_suite": { "businessId": pc_mac } },

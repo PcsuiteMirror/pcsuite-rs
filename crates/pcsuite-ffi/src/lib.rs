@@ -247,6 +247,19 @@ mod ffi {
         fn pcsuite_presence_start() -> Result<(), String>;
         fn pcsuite_presence_stop();
 
+        // App-lifetime 互传 (EasyShare) receiver on :10191, independent of any
+        // session. The phone's 互传「我的设备」entry connects to *this PC's* 10191
+        // when there is no pcsuite session (with one it hands the file to pcsuite,
+        // which arrives as FILE_TRANS_TAG on that session instead) — so, like the
+        // official VivoConnService, the listener must be up from launch, not only
+        // while connected. Received files land in `save_dir`. Events (same JSON
+        // shape as next_file_transfer_event) come from pcsuite_share_recv_next_event();
+        // it returns "" once stopped. While this is running, enable_file_transfer()
+        // does not arm its own per-session listener.
+        fn pcsuite_share_recv_start(save_dir: String) -> Result<(), String>;
+        fn pcsuite_share_recv_next_event() -> String;
+        fn pcsuite_share_recv_stop();
+
         // ── vivo-account mode (opt-in; serverless never calls any of these) ──
         //
         // Select the identity mode: "serverless" (default — no server is ever
@@ -862,18 +875,24 @@ impl PcSession {
                 let _ = tx.send(ev.to_json());
             });
             // 互传 (EasyShare): the phone connects to *our* 10191 and we pull a zip
-            // over its HTTP server — no FILE_TRANS_TAG involved. Arm the listener
-            // here so one switch covers both receive entries. A bind failure (port
-            // taken by the official service / a probe) only disables 互传: it is
-            // logged and 快传 keeps working.
-            let share_cfg = pcsuite_core::ShareConfig { save_dir };
-            match pcsuite_core::ShareReceiver::start(share_cfg, move |ev| {
-                let _ = tx2.send(ev.to_json());
-            })
-            .await
-            {
-                Ok(recv) => *self.share_recv.lock().unwrap() = Some(recv),
-                Err(e) => tracing::warn!(err = %format!("{e:#}"), "互传 receiver unavailable"),
+            // over its HTTP server — no FILE_TRANS_TAG involved. When the app runs
+            // the app-lifetime listener (pcsuite_share_recv_start) that one already
+            // owns the port and its own event queue, so leave it alone; otherwise
+            // (CLI-style use) arm a per-session one here so one switch covers both
+            // receive entries. A bind failure (port taken by the official service /
+            // a probe) only disables 互传: it is logged and 快传 keeps working.
+            if share_recv_global_active() {
+                tracing::info!("互传 listener: app-lifetime instance active, not arming per-session one");
+            } else {
+                let share_cfg = pcsuite_core::ShareConfig { save_dir };
+                match pcsuite_core::ShareReceiver::start(share_cfg, move |ev| {
+                    let _ = tx2.send(ev.to_json());
+                })
+                .await
+                {
+                    Ok(recv) => *self.share_recv.lock().unwrap() = Some(recv),
+                    Err(e) => tracing::warn!(err = %format!("{e:#}"), "互传 receiver unavailable"),
+                }
             }
         });
         Ok(())
@@ -1139,6 +1158,80 @@ fn pcsuite_presence_start() -> Result<(), String> {
 
 fn pcsuite_presence_stop() {
     presence_slot().lock().unwrap().take();
+}
+
+// ── App-lifetime 互传 (EasyShare) listener on :10191 ──
+//
+// Same three-piece shape as the per-session file-transfer receiver (listener,
+// event queue, stop flag), just global: the phone's 互传「我的设备」entry connects
+// to our 10191 whenever there is *no* pcsuite session, so the listener has to
+// outlive sessions.
+
+fn share_recv_slot() -> &'static std::sync::Mutex<Option<pcsuite_core::ShareReceiver>> {
+    static S: OnceLock<std::sync::Mutex<Option<pcsuite_core::ShareReceiver>>> = OnceLock::new();
+    S.get_or_init(Default::default)
+}
+
+fn share_recv_rx() -> &'static std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<String>>> {
+    static R: OnceLock<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<String>>>> =
+        OnceLock::new();
+    R.get_or_init(Default::default)
+}
+
+fn share_recv_stop_flag() -> &'static std::sync::atomic::AtomicBool {
+    static F: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    &F
+}
+
+/// True while the app-lifetime listener owns :10191 — enable_file_transfer()
+/// then leaves 互传 to it instead of failing a second bind.
+fn share_recv_global_active() -> bool {
+    share_recv_slot().lock().unwrap().is_some()
+}
+
+fn pcsuite_share_recv_start(save_dir: String) -> Result<(), String> {
+    // Drop any previous instance first so the port is free for the new bind.
+    share_recv_slot().lock().unwrap().take();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let cfg = pcsuite_core::ShareConfig { save_dir };
+    let recv = rt()
+        .block_on(pcsuite_core::ShareReceiver::start(cfg, move |ev| {
+            let _ = tx.send(ev.to_json());
+        }))
+        .map_err(|e| format!("{e:#}"))?;
+    share_recv_stop_flag().store(false, std::sync::atomic::Ordering::Relaxed);
+    *share_recv_rx().lock().unwrap() = Some(rx);
+    *share_recv_slot().lock().unwrap() = Some(recv);
+    Ok(())
+}
+
+/// Block for the next 互传 event as JSON; "" once stopped (or never started).
+/// Mirrors PcSession::next_file_transfer_event: the receiver is taken out for
+/// the wait and put back afterwards, polling in short slices so stop() is
+/// noticed promptly.
+fn pcsuite_share_recv_next_event() -> String {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    let rx = share_recv_rx().lock().unwrap().take();
+    let Some(mut rx) = rx else { return String::new() };
+    let msg = rt().block_on(async {
+        loop {
+            if share_recv_stop_flag().load(Ordering::Relaxed) {
+                return None;
+            }
+            match tokio::time::timeout(Duration::from_millis(300), rx.recv()).await {
+                Ok(v) => return v, // Some(json) or None (listener dropped → sender gone)
+                Err(_) => continue,
+            }
+        }
+    });
+    *share_recv_rx().lock().unwrap() = Some(rx);
+    msg.unwrap_or_default()
+}
+
+fn pcsuite_share_recv_stop() {
+    share_recv_stop_flag().store(true, std::sync::atomic::Ordering::Relaxed);
+    share_recv_slot().lock().unwrap().take(); // Drop aborts the accept loop
 }
 
 // ── 10191 hold-presence (makes the phone list this PC as 「可连」) ──

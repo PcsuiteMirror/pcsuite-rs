@@ -62,29 +62,55 @@
 //!   too (`Server: VS-HTTP`). **Do not route these through an HTTP proxy** — a
 //!   `502` with an empty body is a proxy talking, not the phone.
 //!
-//! # ★ Mutually exclusive with a live pcsuite session
+//! # ★ Timing is the whole game (2026-09-12)
 //!
-//! **互传 only works when the phone is *not* already connected to this PC.**
-//! `VivoShareServicePool` queries `content://com.vivo.pcsuite/connect_state`
-//! before starting a transfer; when the phone considers itself connected to a
-//! computer it takes the failure branch (`O.d().m(id, 9)` → 「发送失败」) and
-//! never brings up its share HTTP server. With a session live the phone still
-//! opens 10191 and sends the connect frame, and its `extra_info` still claims
-//! `"port":"8080"` — but that port is bound and torn down again within a second.
+//! The phone brings its share server up **before** it dials our 10191, and the
+//! moment a WebSocket attaches it pushes `versionNegotiation` and expects an ack
+//! almost immediately. Answer the connect frame first and connect afterwards —
+//! what this module used to do — and the ~200ms spent reading and replying to
+//! the 10191 frame is enough for the phone to give up: the WS is closed
+//! (`early eof`), the share server is torn down within about a second, and every
+//! later poll gets `Connection refused`.
 //!
-//! Measured A/B on the same phone two minutes apart (iQOO 15, 2026-08-08):
+//! So [`handle_conn`] races: the instant the TCP connection is accepted it spawns
+//! the **entire** WS session (hunt → negotiate → pull the zip) and only then
+//! reads and answers the 10191 frame. Both halves run concurrently and are
+//! independent — on a successful run the file is on disk *before* `bytes:[1]`
+//! goes out:
 //!
-//! | PC state | result |
-//! |---|---|
-//! | no pcsuite session (CLI `share-recv` alone) | `WS up attempts=1`, 3.2MB in 0.41s ✅ |
-//! | live pcsuite session (the macOS app) | 470 polls, every one `Connection refused` ❌ |
+//! ```text
+//! t+0.000  phone connected
+//! t+0.017  WS up (attempts=1)
+//! t+0.041  task announced  count=1 bytes=469542
+//! t+0.112  saved Screenshot_….jpg      ← 469542 bytes, Exif intact
+//! t+0.206  connect frame accepted      ← bytes:[1] only now
+//! ```
 //!
-//! Both 8080 and `HttpConst.DEFAULT_PORT` (10113) were polled in the failing
-//! case — the server had not moved, it simply was not running. This is vendor
-//! design, not a defect here: with a session up, files are meant to travel over
-//! 快传 (`FILE_TRANS_TAG` + mdfs tar, [`crate::filetrans`]) on that session
-//! instead. A frontend that keeps a session open should surface 互传 as
-//! unavailable rather than appear broken.
+//! This was mis-diagnosed several times before the raw-socket probe settled it,
+//! so for the record, all three of these are **false**: the phone does open 8080
+//! (it just lives ~1s); the old code was not too slow to find it (attempt #1
+//! connected every time); and the WS upgrade is not rejected (a clean
+//! `101 Switching Protocols` with `Sec-WebSocket-Protocol: v1.vs.vivo.com.cn`
+//! comes back, followed by the negotiation frame).
+//!
+//! # Which entry the phone picks
+//!
+//! 互传「我的设备」→ this Mac reaches us two different ways, and both now work:
+//!
+//! - **This module (8080)** — when the phone classifies the Mac as ShareDevice
+//!   type 4, i.e. discovered over the LAN by our SSDP beacon
+//!   ([`crate::presence`]). Verified on-device with and without a live session.
+//! - **快传 ([`crate::filetrans`])** — when the entry came from the phone's own
+//!   pcsuite (ShareDevice type 6, the「云传输」badge): `VivoShareServicePool`
+//!   runnable `t` calls `sendFilesByPCSuite()`, so the batch arrives as
+//!   `FILE_TRANS_TAG` on the 10380 control WS instead.
+//!
+//! The numeric types name a discovery channel, not an OS — the phone's own
+//! `DeviceCache` merge logs them as `PC_BLE` (3) and `PC_SUITE` (6). Registering
+//! the PC in the cloud as Windows rather than Mac changes nothing (tested).
+//! Note the merge in `DeviceCache.u()` keeps a cached type-6 entry and discards
+//! an incoming type-4 one, so a stale pcsuite entry can pin the phone to the
+//! 快传 route until VivoShare's process restarts.
 //!
 //! Verified on-device (iQOO 15 → Mac, `re_vcs/share_probe4.py` and the CLI):
 //! screenshots and an 8.8MB photo arrive intact and the phone reports「发送成功」.
@@ -116,6 +142,10 @@ pub const SHARE_PORT: u16 = 10191;
 /// Service id of the 互传 connect frame (protocol-mandated wire constant).
 pub const SHARE_SERVICE_ID: &str = "com.vivo.share.CONNECT_PC";
 
+/// The phone's share HTTP/WS port. Every observed connect frame names 8080; the
+/// frame's own value still wins if it ever differs.
+const DEFAULT_SHARE_PORT: u16 = 8080;
+
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 /// Idle cap on any single socket read (a stalled phone shouldn't hang forever).
 const READ_TIMEOUT: Duration = Duration::from_secs(120);
@@ -126,8 +156,12 @@ const WS_PATH: &str = "/websocket";
 const WS_SUBPROTOCOL: &str = "v1.vs.vivo.com.cn";
 /// How long to keep hunting for the phone's (flapping) share server.
 const WS_WINDOW: Duration = Duration::from_secs(90);
-const WS_POLL_INTERVAL: Duration = Duration::from_millis(300);
-const WS_CONNECT_TIMEOUT: Duration = Duration::from_millis(800);
+/// Poll fast: on a phone running the 2026-08-28 image the share server can live
+/// for barely a second (it is started *before* the phone re-checks whether a PC
+/// is already connected, and torn down again when that check rejects the
+/// transfer), so a lazy poll misses the window entirely.
+const WS_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const WS_CONNECT_TIMEOUT: Duration = Duration::from_millis(400);
 /// Time allowed for the phone's connect frame after TCP accept.
 const FRAME_TIMEOUT: Duration = Duration::from_secs(30);
 /// The connect JSON is small; refuse to buffer more than this while framing.
@@ -230,7 +264,7 @@ where
                 let flag = committed.clone();
                 let handle = tokio::spawn(async move {
                     if let Err(e) =
-                        handle_conn(sock, &peer.ip().to_string(), &cfg, on_event.as_ref(), flag, !busy)
+                        handle_conn(sock, &peer.ip().to_string(), &cfg, on_event.clone(), flag, !busy)
                             .await
                     {
                         tracing::warn!(%peer, err = %format!("{e:#}"), "互传: session failed");
@@ -258,13 +292,44 @@ async fn handle_conn<F>(
     mut sock: TcpStream,
     phone_ip: &str,
     cfg: &ShareConfig,
-    on_event: &F,
+    on_event: std::sync::Arc<F>,
     committed: std::sync::Arc<AtomicBool>,
     run_session: bool,
 ) -> Result<()>
 where
     F: Fn(FileTransEvent) + Send + Sync + 'static,
 {
+    // ★ Start hunting the phone's share server *now*, before we even read the
+    // connect frame. On the phone's 2026-08-28 image the server is already up by
+    // the time it dials our 10191, and it pushes `versionNegotiation` the moment
+    // a WebSocket attaches — then tears the whole task down a fraction of a
+    // second after it processes our `bytes:[1]`. Answering first and connecting
+    // afterwards (what this module used to do) loses the race by ~200ms and only
+    // ever sees `Connection refused`; racing in at accept time gets a clean 101.
+    // The port is 8080 in every observed frame; a frame naming a different one
+    // falls back to a fresh hunt below.
+    // The task must run the *whole* WS session, not just the connect: the phone
+    // pushes `versionNegotiation` within ~2ms of the socket attaching and closes
+    // it again if that goes unanswered while we are still busy replying on 10191.
+    let session = run_session.then(|| {
+        let ip = phone_ip.to_string();
+        let save_dir = cfg.save_dir.clone();
+        let ev = on_event.clone();
+        let committed = committed.clone();
+        tokio::spawn(async move {
+            let ws = grab_ws(&ip, DEFAULT_SHARE_PORT).await?;
+            pull_batch(
+                ws,
+                &ip,
+                DEFAULT_SHARE_PORT,
+                &save_dir,
+                &committed,
+                ev.as_ref(),
+            )
+            .await
+        })
+    });
+
     let body = read_first_frame(&mut sock).await?;
     let v: Value = serde_json::from_slice(&body).context("互传 connect frame was not JSON")?;
     let service_id = v.get("service_id").and_then(Value::as_str).unwrap_or("");
@@ -286,9 +351,11 @@ where
     let frame_id = v.get("id").and_then(Value::as_i64).unwrap_or(config::FRAME_ID);
     let extra_raw = v.get("extra_info").and_then(Value::as_str).unwrap_or("");
     tracing::info!(device = %device_name, http_port = port, extra_info = %extra_raw, "互传: connect frame accepted");
-    // File names are unknown until the zip arrives — an empty `files` marks this as
-    // an 互传 batch for the frontend (快传 batches always carry ≥1 name).
-    on_event(FileTransEvent::Started { files: vec![] });
+    // NOTE: no `Started` event here. Answering this frame does **not** mean a
+    // transfer is coming: since the phone's 2026-08-28 system update the same
+    // handshake is emitted by ConnBase merely to set up the link, and on a Mac
+    // target the files then travel over 快传 instead (see the module docs). We
+    // only announce a batch once the phone's WS actually hands us a task.
 
     // Reply `bytes:[1]` (= accept), shell mirroring the request, identity ours.
     let id = config::default_identity();
@@ -314,7 +381,17 @@ where
         return Ok(());
     }
 
-    match pull_batch(phone_ip, port, &cfg.save_dir, &committed).await {
+    if port != DEFAULT_SHARE_PORT {
+        tracing::warn!(
+            port,
+            "互传: frame named a non-default share port; the session raced {DEFAULT_SHARE_PORT}"
+        );
+    }
+    let outcome = match session {
+        Some(handle) => handle.await.context("互传: session task did not finish")?,
+        None => return Ok(()),
+    };
+    match outcome {
         Ok(saved) => {
             on_event(FileTransEvent::Done {
                 files: saved,
@@ -378,15 +455,18 @@ fn parse_extra_port(extra: &str) -> u16 {
 
 /// Grab the phone's `/websocket` and run the v1 exchange to completion.
 /// Returns the basenames actually written.
-async fn pull_batch(
+async fn pull_batch<F>(
+    mut ws: WsClient<TcpStream>,
     phone_ip: &str,
     port: u16,
     save_dir: &str,
     committed: &AtomicBool,
-) -> Result<Vec<String>> {
+    on_event: &F,
+) -> Result<Vec<String>>
+where
+    F: Fn(FileTransEvent) + Send + Sync + 'static,
+{
     std::fs::create_dir_all(save_dir).with_context(|| format!("mkdir {save_dir}"))?;
-
-    let mut ws = grab_ws(phone_ip, port).await?;
     let mut saved: Option<Result<Vec<String>>> = None;
 
     loop {
@@ -432,6 +512,10 @@ async fn pull_batch(
                 let count = info.get("fileCount").and_then(Value::as_i64).unwrap_or(-1);
                 let bytes = info.get("totalSize").and_then(Value::as_i64).unwrap_or(-1);
                 tracing::info!(task = %task_id, count, bytes, "互传: task announced");
+                // Now a transfer really is coming. File names only arrive with the
+                // zip, so `files` stays empty — that is what marks a batch as 互传
+                // for the frontend (快传 batches always carry ≥1 name).
+                on_event(FileTransEvent::Started { files: vec![] });
                 // ★ This ack carries a body. A bare `ack:N:sendRequest` makes the
                 //   phone drop the WS immediately (observed on-device).
                 ws.send_text(&format!("ack:{mid}:sendRequest?{{\"versions\":[1]}}"))
@@ -505,7 +589,16 @@ async fn grab_ws(phone_ip: &str, port: u16) -> Result<WsClient<TcpStream>> {
                 tracing::info!(attempts, "互传: WS up");
                 return Ok(ws);
             }
-            Err(e) => last = format!("{e:#}"),
+            Err(e) => {
+                last = format!("{e:#}");
+                // The very first failure is the diagnostic one: "connection
+                // refused" means the phone never opened its server, while an
+                // upgrade error means it did and rejected us — completely
+                // different bugs. Later attempts are logged sparsely.
+                if attempts == 1 || attempts.is_multiple_of(50) {
+                    tracing::info!(attempts, err = %last, "互传: share server not reachable yet");
+                }
+            }
         }
         tokio::time::sleep(WS_POLL_INTERVAL).await;
     }

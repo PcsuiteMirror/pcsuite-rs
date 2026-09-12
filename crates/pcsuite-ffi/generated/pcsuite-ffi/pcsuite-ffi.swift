@@ -37,6 +37,15 @@ public func pcsuite_presence_start() throws -> () {
 public func pcsuite_presence_stop() {
     __swift_bridge__$pcsuite_presence_stop()
 }
+public func pcsuite_share_recv_start<GenericIntoRustString: IntoRustString>(_ save_dir: GenericIntoRustString) throws -> () {
+    try { let val = __swift_bridge__$pcsuite_share_recv_start({ let rustString = save_dir.intoRustString(); rustString.isOwned = false; return rustString.ptr }()); if val != nil { throw RustString(ptr: val!) } else { return } }()
+}
+public func pcsuite_share_recv_next_event() -> RustString {
+    RustString(ptr: __swift_bridge__$pcsuite_share_recv_next_event())
+}
+public func pcsuite_share_recv_stop() {
+    __swift_bridge__$pcsuite_share_recv_stop()
+}
 public func pcsuite_set_mode<GenericIntoRustString: IntoRustString>(_ mode: GenericIntoRustString) {
     __swift_bridge__$pcsuite_set_mode({ let rustString = mode.intoRustString(); rustString.isOwned = false; return rustString.ptr }())
 }
