@@ -1648,19 +1648,27 @@ fn cloud_recv_wake() -> &'static tokio::sync::Notify {
 /// One pass over the relay. Silent when there is nothing to do — including when
 /// the user is in serverless mode or not signed in, which is the normal state
 /// for most users and must not produce an error event on every tick.
-async fn cloud_recv_once(save_dir: &str, tx: &tokio::sync::mpsc::UnboundedSender<String>) {
+///
+/// Returns false when the account was not configured *yet*, which at launch is a
+/// race rather than a decision: the poller is armed from `AppModel.init()` but
+/// the credentials arrive from the app delegate, so the first pass can easily
+/// run against an empty account. The caller retries soon instead of sleeping out
+/// the full interval, otherwise a transfer that is already waiting sits there
+/// until the next tick.
+async fn cloud_recv_once(save_dir: &str, tx: &tokio::sync::mpsc::UnboundedSender<String>) -> bool {
     if !config::mode().uses_cloud() {
-        return;
+        // A deliberate choice, not a race — nothing to wait for.
+        return true;
     }
     let account = cloud_account().read().unwrap().clone();
     if !account.is_complete() {
-        return;
+        return false;
     }
     let client = match pcsuite_core::cloudshare::CloudShare::new(account) {
         Ok(c) => c,
         Err(e) => {
             tracing::debug!(error = %e, "云传输: client unavailable");
-            return;
+            return true;
         }
     };
 
@@ -1675,6 +1683,7 @@ async fn cloud_recv_once(save_dir: &str, tx: &tokio::sync::mpsc::UnboundedSender
         // log it rather than telling the user a file could not be received.
         tracing::debug!(error = %format!("{e:#}"), "云传输: poll failed");
     }
+    true
 }
 
 fn pcsuite_cloud_recv_start(save_dir: String, interval_secs: f64) -> Result<(), String> {
@@ -1686,12 +1695,16 @@ fn pcsuite_cloud_recv_start(save_dir: String, interval_secs: f64) -> Result<(), 
     cloud_recv_stop_flag().store(false, std::sync::atomic::Ordering::Relaxed);
     *cloud_recv_rx().lock().unwrap() = Some(rx);
 
-    let interval = std::time::Duration::from_secs_f64(interval_secs.max(30.0));
+    // Floor is a sanity guard only — the caller picks the real cadence.
+    let interval = std::time::Duration::from_secs_f64(interval_secs.max(5.0));
+    // While the app is still installing the account, come back quickly.
+    let not_ready_retry = std::time::Duration::from_secs(2);
     let handle = rt().spawn(async move {
         loop {
-            cloud_recv_once(&save_dir, &tx).await;
+            let ready = cloud_recv_once(&save_dir, &tx).await;
+            let wait = if ready { interval } else { not_ready_retry };
             tokio::select! {
-                _ = tokio::time::sleep(interval) => {}
+                _ = tokio::time::sleep(wait) => {}
                 _ = cloud_recv_wake().notified() => {}
             }
         }
