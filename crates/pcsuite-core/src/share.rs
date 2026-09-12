@@ -370,13 +370,11 @@ where
         "bytes": [1],
         "deviceName": id.device_name,
     });
-    sock
-        .write_all(&payload1::encode_json(&reply)?)
-        .await
-        .context("send accept frame")?;
-    sock.flush().await.ok();
+    let accept_frame = payload1::encode_json(&reply)?;
 
     if !run_session {
+        sock.write_all(&accept_frame).await.context("send accept frame")?;
+        sock.flush().await.ok();
         tracing::info!("互传: connection accepted but left idle (another transfer owns the phone)");
         return Ok(());
     }
@@ -387,10 +385,25 @@ where
             "互传: frame named a non-default share port; the session raced {DEFAULT_SHARE_PORT}"
         );
     }
+
+    // ★ Send `bytes:[1]` only once the transfer is done. On the phone's current
+    // build this answer *ends* the share session: the WS is closed within tens of
+    // milliseconds of it arriving (observed 9ms with a raw probe, 59ms here).
+    // Small files never noticed because the zip had already landed by then —
+    // in a successful run `saved` is logged *before* this frame goes out — but a
+    // 157MB pull was still streaming and died with `early eof` / `EOF inside
+    // chunked stream`, and the phone's device row showed「发送失败」.
     let outcome = match session {
         Some(handle) => handle.await.context("互传: session task did not finish")?,
-        None => return Ok(()),
+        None => {
+            sock.write_all(&accept_frame).await.context("send accept frame")?;
+            sock.flush().await.ok();
+            return Ok(());
+        }
     };
+    sock.write_all(&accept_frame).await.context("send accept frame")?;
+    sock.flush().await.ok();
+    tracing::info!("互传: connect frame answered (bytes:[1]) after the transfer");
     match outcome {
         Ok(saved) => {
             on_event(FileTransEvent::Done {
@@ -468,19 +481,70 @@ where
 {
     std::fs::create_dir_all(save_dir).with_context(|| format!("mkdir {save_dir}"))?;
     let mut saved: Option<Result<Vec<String>>> = None;
+    // The zip pull runs as its own task so the loop below keeps answering the
+    // phone while it streams; `pending_task` is the taskId to report against.
+    let mut download: Option<JoinHandle<Result<Vec<String>>>> = None;
+    let mut pending_task: Option<String> = None;
 
     loop {
-        let frame = tokio::time::timeout(READ_TIMEOUT, ws.recv())
-            .await
-            .context("互传: timed out waiting for a WS frame")?
-            .context("互传: WS read failed")?;
+        let frame = tokio::select! {
+            // Finished pulling: report the outcome the way the official client
+            // does, then stop. Checked first so a completed download is not made
+            // to wait on the next WS frame.
+            res = async { download.as_mut().expect("guarded").await }, if download.is_some() => {
+                let task_id = pending_task.take().unwrap_or_default();
+                let result = match res {
+                    Ok(r) => r,
+                    Err(e) => Err(anyhow::anyhow!("互传: download task failed: {e}")),
+                };
+                let ty = if result.is_ok() { "1" } else { "2" };
+                let end = format!("action:2:status?{{\"taskId\":\"{task_id}\",\"type\":\"{ty}\"}}");
+                if let Err(e) = ws.send_text(&end).await {
+                    tracing::warn!(err = %e, "互传: could not report final status");
+                }
+                saved = Some(result);
+                break;
+            }
+            frame = tokio::time::timeout(READ_TIMEOUT, ws.recv()) => {
+                match frame.context("互传: timed out waiting for a WS frame")? {
+                    Ok(f) => f,
+                    // The socket died under us. If a pull is still running it is
+                    // on its own HTTP connection and may well finish, so keep it
+                    // rather than throwing away a transfer that is nearly done —
+                    // we just cannot report status back on a dead WS.
+                    Err(e) => {
+                        if let Some(handle) = download.take() {
+                            tracing::warn!(err = %e, "互传: WS died mid-download; awaiting the pull anyway");
+                            saved = Some(match handle.await {
+                                Ok(r) => r,
+                                Err(je) => Err(anyhow::anyhow!("互传: download task failed: {je}")),
+                            });
+                            break;
+                        }
+                        return Err(anyhow::Error::new(e).context("互传: WS read failed"));
+                    }
+                }
+            }
+        };
         let msg = match frame {
             WsFrame::Text(t) => t,
             WsFrame::Ping(p) => {
                 ws.send_pong(&p).await.ok();
                 continue;
             }
-            WsFrame::Close => break,
+            // The phone sometimes closes as soon as it has streamed the zip. If
+            // a pull is still running, let it finish (we simply cannot report
+            // status on a closed socket) instead of throwing the transfer away.
+            WsFrame::Close => {
+                if let Some(handle) = download.take() {
+                    saved = Some(match handle.await {
+                        Ok(r) => r,
+                        Err(e) => Err(anyhow::anyhow!("互传: download task failed: {e}")),
+                    });
+                    tracing::info!("互传: phone closed the WS while downloading; kept the result");
+                }
+                break;
+            }
             _ => continue,
         };
         let Some((mid, action, extra)) = parse_action(&msg) else {
@@ -524,15 +588,21 @@ where
 
                 // From here on this session owns the phone: no further tap may abort it.
                 committed.store(true, Ordering::SeqCst);
-                let result = download_batch(phone_ip, port, &task_id, save_dir).await;
-                // Report the outcome the way the official client does, then stop.
-                let ty = if result.is_ok() { "1" } else { "2" };
-                let end = format!("action:2:status?{{\"taskId\":\"{task_id}\",\"type\":\"{ty}\"}}");
-                if let Err(e) = ws.send_text(&end).await {
-                    tracing::warn!(err = %e, "互传: could not report final status");
-                }
-                saved = Some(result);
-                break;
+                // ★ Download off-loop. Pulling the zip inline blocks this read
+                // loop for the whole transfer, and on anything big the phone
+                // speaks again before it finishes — gets no ack inside its 5s
+                // window — and kills the HTTP stream, which surfaces here as
+                // `EOF inside chunked stream`. (Observed: 12MB fine, 157MB dead
+                // after 0.6s.) It also delayed the final `action:2:status` past
+                // the point the phone had given up, so a file that *did* land
+                // still showed「发送失败」on the device row.
+                download = Some(tokio::spawn({
+                    let ip = phone_ip.to_string();
+                    let dir = save_dir.to_string();
+                    let task = task_id.clone();
+                    async move { download_batch(&ip, port, &task, &dir).await }
+                }));
+                pending_task = Some(task_id);
             }
 
             // Unknown actions still need an ack or the phone stalls on its 5s timer.
