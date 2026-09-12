@@ -88,6 +88,47 @@ pub fn req_authrity(source: i64) -> String {
     format!("req_authrity{{\"source\":{source}}}")
 }
 
+/// A request the phone's connection center sends over the control WS when the user
+/// taps one of the PC's function buttons on the phone:
+/// `connectCenterMsg:{"data":{"deviceId":"<this PC>"},"msgId":"…","name":"openVivoScreen"}`.
+///
+/// The PC answers on the same WS with `connectCenterResult:` carrying the *same*
+/// `msgId` and a `{code, reason}` result (`code` 0 = done) — `MobileDevice.
+/// replyMsgToConnectCenter` in the official bundle. `openVivoScreen` is the phone
+/// asking this PC to start mirroring (the official desktop answers it by sending
+/// `req_authrity{"source":2}` and opening the mirror once the phone authorizes);
+/// `closeVivoScreen` stops it. `openExtScreen`/`closeExtScreen` are the
+/// extended-desktop equivalents, which we do not implement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectCenterMsg {
+    pub name: String,
+    pub msg_id: String,
+}
+
+/// Parse a `connectCenterMsg:` control-WS text, or `None` for anything else.
+pub fn parse_connect_center(text: &str) -> Option<ConnectCenterMsg> {
+    let body = text.strip_prefix("connectCenterMsg:")?;
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let name = v.get("name")?.as_str()?.to_string();
+    // msgId is a string in practice; tolerate a number so a reply still correlates.
+    let msg_id = match v.get("msgId") {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Number(n)) => n.to_string(),
+        _ => String::new(),
+    };
+    Some(ConnectCenterMsg { name, msg_id })
+}
+
+/// Build the `connectCenterResult:` answer to a [`ConnectCenterMsg`].
+pub fn connect_center_result(name: &str, msg_id: &str, code: i64, reason: &str) -> String {
+    let v = serde_json::json!({
+        "name": name,
+        "msgId": msg_id,
+        "data": { "code": code, "reason": reason },
+    });
+    format!("connectCenterResult:{v}")
+}
+
 /// Periodic control-WS keepalive text.
 pub const KEEPALIVE: &str = "normal";
 
@@ -267,6 +308,23 @@ mod tests {
         // Without the flag the 10-byte header stays, and the packet is unrecognisable —
         // the exact failure that sent audio into the video decoder.
         assert!(!is_audio_frame(strip_frame_header(&pkt, false)));
+    }
+
+    #[test]
+    fn connect_center_roundtrip() {
+        let raw = r#"connectCenterMsg:{"data":{"deviceId":"d114…"},"msgId":"1789179743827","name":"openVivoScreen"}"#;
+        let m = parse_connect_center(raw).expect("parses");
+        assert_eq!(m.name, "openVivoScreen");
+        assert_eq!(m.msg_id, "1789179743827");
+        assert!(parse_connect_center("normal").is_none());
+        assert!(parse_connect_center("connectCenterMsg:not json").is_none());
+
+        let reply = connect_center_result(&m.name, &m.msg_id, 0, "");
+        let body = reply.strip_prefix("connectCenterResult:").expect("prefix");
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(v["name"], "openVivoScreen");
+        assert_eq!(v["msgId"], "1789179743827");
+        assert_eq!(v["data"]["code"], 0);
     }
 
     #[test]

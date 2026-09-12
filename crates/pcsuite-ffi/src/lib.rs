@@ -117,6 +117,16 @@ mod ffi {
         fn next_notification(&self) -> String;
         // Ask the notify poller to stop (mirror of stop_verify for notifications).
         fn stop_notify(&self);
+        // Block until the phone's connection center asks this PC to do something with
+        // one of its function buttons, returning "<name>\t<msgId>" ("" = stopped /
+        // session over). Names: openVivoScreen (start mirroring — the phone's 「投屏」),
+        // closeVivoScreen. ALWAYS answer with reply_connect_center(name, msgId, …):
+        // the phone's button waits on that reply.
+        fn next_connect_center_request(&self) -> String;
+        fn stop_connect_center(&self);
+        // Answer a connection-center request; code 0 = done, anything else is a failure
+        // whose reason the phone shows.
+        fn reply_connect_center(&self, name: String, msg_id: String, code: i64, reason: String);
 
         // Upload local files to the phone (the desktop app's drag-and-drop path):
         // drop_files_info + a streamed tar over the 10380 HTTP gateway. `save_dir`
@@ -428,6 +438,12 @@ pub struct PcSession {
     // own SHADOW startup (it would rotate the clipboard keys mid-handshake and break
     // phone→PC sync) — it waits for the clipboard handshake's retained reply instead.
     clipboard_active: std::sync::atomic::AtomicBool,
+    // Phone connection-center requests (its function buttons: 「投屏」 …) arrive as text
+    // on the shared control WS. Subscribed lazily on first poll; a broadcast receiver
+    // only sees messages sent after it subscribes, which is fine — the phone sends these
+    // when the user taps, long after connect.
+    center_rx: tokio::sync::Mutex<Option<tokio::sync::broadcast::Receiver<String>>>,
+    center_stop: std::sync::atomic::AtomicBool,
     // Liveness of the shared control WS; reads `Some(why)` once the connection is gone.
     dead_rx: tokio::sync::Mutex<tokio::sync::watch::Receiver<Option<DeadReason>>>,
     // Set by stop_watch(); the disconnect watcher checks it between short timeouts.
@@ -712,6 +728,57 @@ impl PcSession {
 
     fn stop_notify(&self) {
         self.notify_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Block until the phone's connection center asks this PC to do something (its
+    /// function buttons: 「投屏」 → `openVivoScreen`, closing it → `closeVivoScreen`),
+    /// returning `"<name>\t<msgId>"`. Empty string once stopped or the session ended —
+    /// same shape as `next_notification`, so the app pumps it the same way.
+    ///
+    /// Answer every one with `reply_connect_center` (same name + msgId): the phone's
+    /// button waits on that reply.
+    fn next_connect_center_request(&self) -> String {
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+        let msg = rt().block_on(async {
+            let mut guard = self.center_rx.lock().await;
+            if guard.is_none() {
+                *guard = Some(self.session.lock().await.control().subscribe());
+            }
+            let rx = guard.as_mut().expect("subscribed above");
+            loop {
+                if self.center_stop.load(Ordering::Relaxed) {
+                    return None;
+                }
+                match tokio::time::timeout(Duration::from_millis(300), rx.recv()).await {
+                    Ok(Ok(text)) => {
+                        if let Some(req) = pcsuite_core::parse_connect_center(&text) {
+                            return Some(format!("{}\t{}", req.name, req.msg_id));
+                        }
+                    }
+                    // Lagged: the phone out-ran the buffer; keep listening.
+                    Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                    Ok(Err(_)) => return None, // control WS gone
+                    Err(_) => continue,        // poll timeout
+                }
+            }
+        });
+        msg.unwrap_or_default()
+    }
+
+    fn stop_connect_center(&self) {
+        self.center_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Answer a connection-center request (`code` 0 = done).
+    fn reply_connect_center(&self, name: String, msg_id: String, code: i64, reason: String) {
+        let _ = rt().block_on(async {
+            self.session
+                .lock()
+                .await
+                .reply_connect_center(&name, &msg_id, code, &reason)
+                .await
+        });
     }
 
     fn push_files(&self, paths: Vec<String>, save_dir: String) -> Result<String, String> {
@@ -1336,6 +1403,8 @@ fn pcsuite_connect_usb() -> Result<PcSession, String> {
         share_recv: std::sync::Mutex::new(None),
         device_id_cache: std::sync::Mutex::new(String::new()),
         clipboard_active: std::sync::atomic::AtomicBool::new(false),
+        center_rx: tokio::sync::Mutex::new(None),
+        center_stop: std::sync::atomic::AtomicBool::new(false),
         dead_rx: tokio::sync::Mutex::new(dead_rx),
         watch_stop: std::sync::atomic::AtomicBool::new(false),
         token: u.token,
@@ -1447,6 +1516,8 @@ fn build_wlan_session(
         share_recv: std::sync::Mutex::new(None),
         device_id_cache: std::sync::Mutex::new(String::new()),
         clipboard_active: std::sync::atomic::AtomicBool::new(false),
+        center_rx: tokio::sync::Mutex::new(None),
+        center_stop: std::sync::atomic::AtomicBool::new(false),
         dead_rx: tokio::sync::Mutex::new(dead_rx),
         watch_stop: std::sync::atomic::AtomicBool::new(false),
         token,

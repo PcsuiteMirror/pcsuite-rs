@@ -1305,33 +1305,88 @@ async fn cmd_cloud_presence(args: &Args) -> Result<()> {
             match opened {
                 // Hold the session (and its registration) until the phone or the
                 // link ends it, then let presence take the link back.
-                Ok((session, _reg)) => {
+                Ok((mut session, _reg)) => {
                     println!(
                         "   ✅ 已连接 (10380 控制会话) → 在 presence 连接上回报 retCode=0;手机此时应翻成功能按钮。"
                     );
                     // Report *before* parking on the session: the phone gives up on the
                     // ask-connect in ~5s.
                     let _ = answer_tx.send(ConnectAnswer::ok());
-                    // Log what the phone sends on the control WS — this is where a
-                    // phone-initiated action (e.g. tapping 「投屏」 on its device card)
-                    // arrives, and we do not handle any of those yet.
+                    // The phone's function buttons arrive here as
+                    // `connectCenterMsg:{name,msgId,…}`; 「投屏」 is `openVivoScreen`.
+                    // Start the mirror (authority source 2 = the connection center asked,
+                    // like the official desktop) and answer with the same msgId, or the
+                    // phone's button never settles.
                     let mut rx = session.control().subscribe();
-                    tokio::spawn(async move {
-                        while let Ok(msg) = rx.recv().await {
-                            let head: String = msg.chars().take(400).collect();
-                            println!("   📥 控制 WS 收到: {head}");
-                        }
-                    });
+                    // The mirror stream needs a consumer: this CLI has no window, so a
+                    // task drains the frames (and reports) instead of letting the
+                    // channel back up.
+                    let mut screen: Option<tokio::task::JoinHandle<()>> = None;
                     let mut dead = session.dead_signal();
                     let reason = loop {
                         let cur = *dead.borrow();
                         if cur.is_some() {
                             break cur;
                         }
-                        if dead.changed().await.is_err() {
-                            break None;
+                        tokio::select! {
+                            changed = dead.changed() => {
+                                if changed.is_err() { break None; }
+                            }
+                            msg = rx.recv() => {
+                                let Ok(msg) = msg else { continue };
+                                let Some(req) = pcsuite_core::parse_connect_center(&msg) else {
+                                    continue;
+                                };
+                                println!("   📲 手机请求: {} (msgId={})", req.name, req.msg_id);
+                                match req.name.as_str() {
+                                    "openVivoScreen" => {
+                                        let params = ScreenParams::default();
+                                        match session.enable_screen_from(params, 2).await {
+                                            Ok(mut s) => {
+                                                println!("   ✅ 投屏已开启(手机发起), 开始收帧…");
+                                                screen = Some(tokio::spawn(async move {
+                                                    let mut n: u64 = 0;
+                                                    while s.next_frame().await.is_some() {
+                                                        n += 1;
+                                                        if n % 200 == 0 {
+                                                            println!("   … 已收 {n} 帧");
+                                                        }
+                                                    }
+                                                }));
+                                                let _ = session
+                                                    .reply_connect_center(&req.name, &req.msg_id, 0, "")
+                                                    .await;
+                                            }
+                                            Err(e) => {
+                                                println!("   投屏失败: {e:#}");
+                                                let _ = session
+                                                    .reply_connect_center(
+                                                        &req.name,
+                                                        &req.msg_id,
+                                                        -1,
+                                                        &format!("{e:#}"),
+                                                    )
+                                                    .await;
+                                            }
+                                        }
+                                    }
+                                    "closeVivoScreen" => {
+                                        if let Some(h) = screen.take() {
+                                            h.abort();   // drops the stream → ends it
+                                        }
+                                        println!("   ⏹  投屏已关闭(手机发起)");
+                                        let _ = session
+                                            .reply_connect_center(&req.name, &req.msg_id, 0, "")
+                                            .await;
+                                    }
+                                    other => println!("   (未实现: {other})"),
+                                }
+                            }
                         }
                     };
+                    if let Some(h) = screen.take() {
+                        h.abort();
+                    }
                     println!("   会话结束({reason:?}) → 恢复 presence 保活。");
                 }
                 Err(e) => {

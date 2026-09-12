@@ -167,6 +167,21 @@ impl Session {
         })
     }
 
+    /// Answer a phone connection-center request (`connectCenterResult:` with the same
+    /// `msgId`); `code` 0 means done. The phone's card waits on this — without it the
+    /// button it lit up never settles.
+    pub async fn reply_connect_center(
+        &self,
+        name: &str,
+        msg_id: &str,
+        code: i64,
+        reason: &str,
+    ) -> Result<()> {
+        self.control
+            .send(screenmsg::connect_center_result(name, msg_id, code, reason))
+            .await
+    }
+
     /// A clone of the control handle.
     pub fn control(&self) -> ControlHandle {
         self.control.clone()
@@ -352,7 +367,18 @@ impl Session {
 
     /// Enable screen mirroring; returns a [`ScreenStream`] of raw HEVC frames.
     pub async fn enable_screen(&mut self, params: ScreenParams) -> Result<ScreenStream> {
-        self.control.send(screenmsg::req_authrity(1)).await?;
+        self.enable_screen_from(params, 1).await
+    }
+
+    /// Enable mirroring, saying who asked: `source` 1 = this PC, **2 = the phone's
+    /// connection center** (the official desktop sends `req_authrity{"source":2}` when
+    /// answering an `openVivoScreen` request).
+    pub async fn enable_screen_from(
+        &mut self,
+        params: ScreenParams,
+        source: i64,
+    ) -> Result<ScreenStream> {
+        self.control.send(screenmsg::req_authrity(source)).await?;
 
         let mut opened = false;
         for _ in 0..25 {

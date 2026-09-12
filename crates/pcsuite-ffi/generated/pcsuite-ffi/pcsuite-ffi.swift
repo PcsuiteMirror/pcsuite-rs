@@ -223,6 +223,18 @@ extension PcSessionRef {
         __swift_bridge__$PcSession$stop_notify(ptr)
     }
 
+    public func next_connect_center_request() -> RustString {
+        RustString(ptr: __swift_bridge__$PcSession$next_connect_center_request(ptr))
+    }
+
+    public func stop_connect_center() {
+        __swift_bridge__$PcSession$stop_connect_center(ptr)
+    }
+
+    public func reply_connect_center<GenericIntoRustString: IntoRustString>(_ name: GenericIntoRustString, _ msg_id: GenericIntoRustString, _ code: Int64, _ reason: GenericIntoRustString) {
+        __swift_bridge__$PcSession$reply_connect_center(ptr, { let rustString = name.intoRustString(); rustString.isOwned = false; return rustString.ptr }(), { let rustString = msg_id.intoRustString(); rustString.isOwned = false; return rustString.ptr }(), code, { let rustString = reason.intoRustString(); rustString.isOwned = false; return rustString.ptr }())
+    }
+
     public func push_files<GenericIntoRustString: IntoRustString>(_ paths: RustVec<GenericIntoRustString>, _ save_dir: GenericIntoRustString) throws -> RustString {
         try { let val = __swift_bridge__$PcSession$push_files(ptr, { let val = paths; val.isOwned = false; return val.ptr }(), { let rustString = save_dir.intoRustString(); rustString.isOwned = false; return rustString.ptr }()); if val.is_ok { return RustString(ptr: val.ok_or_err!) } else { throw RustString(ptr: val.ok_or_err!) } }()
     }

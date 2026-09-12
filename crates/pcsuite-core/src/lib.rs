@@ -48,5 +48,5 @@ pub use verify::{run_verify, VerifyConfig};
 // Re-exports so frontends/CLIs depend only on this crate.
 pub use pcsuite_proto::input::{MouseAction, MouseButton};
 pub use pcsuite_proto::notify::Notification;
-pub use pcsuite_proto::screen::ScreenParams;
+pub use pcsuite_proto::screen::{parse_connect_center, ConnectCenterMsg, ScreenParams};
 pub use pcsuite_proto::PcIdentity;
