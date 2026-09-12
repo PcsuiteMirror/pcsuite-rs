@@ -254,6 +254,16 @@ async fn main() -> Result<()> {
         .init();
 
     let args = parse_args();
+    // Signed in, the account's openId is the one the phone checks a LAN sign
+    // against (and the one the shared clipboard is scoped by), so every command
+    // gets it without a PCSUITE_OPEN_ID of its own. The env var, when set, is an
+    // explicit choice and still wins, matching the documented precedence.
+    if std::env::var("PCSUITE_OPEN_ID").is_err() {
+        if let Some(acc) = cloud::load_account() {
+            tracing::debug!(open_id = %acc.open_id, "openId from the signed-in account");
+            config::set_open_id(acc.open_id);
+        }
+    }
     match args.cmd.as_str() {
         "screen" => cmd_screen(args).await,
         "clipboard" => cmd_clipboard(args).await,
@@ -1369,11 +1379,8 @@ fn default_download_dir() -> String {
 async fn cmd_cloud_presence(args: &Args) -> Result<()> {
     // The LAN sign carries the openId the phone checks against its own account
     // (connbase rejects a mismatch with bytes:[28]). In account mode that openId
-    // lives in the account, not the config identity — feed it in, or the sign
-    // goes out with the placeholder openId and the phone rejects it.
-    if let Some(acc) = cloud::load_account() {
-        config::set_open_id(acc.open_id);
-    }
+    // lives in the account, not the config identity — main() fed it into the
+    // identity before dispatching here.
     let identity = config::default_identity();
     if config::is_pc_mac_placeholder(&identity.pc_mac) {
         anyhow::bail!(

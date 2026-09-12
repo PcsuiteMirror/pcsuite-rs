@@ -74,9 +74,12 @@ seeds are **not** hardcoded — they load at runtime, with this precedence:
 
 1. environment variables — `PCSUITE_OPEN_ID`, `PCSUITE_PC_MAC`, `PCSUITE_ACCOUNT`,
    `PCSUITE_DEVICE_NAME`, `PCSUITE_SEED`;
-2. a JSON file — `$PCSUITE_CONFIG`, else `./pcsuite.json`, else
+2. for the openId only: the signed-in vivo account (`pcsuite cloud login`) — it is
+   the value the phone checks a LAN sign against, so every command uses it while
+   signed in;
+3. a JSON file — `$PCSUITE_CONFIG`, else `./pcsuite.json`, else
    `$HOME/.config/pcsuite/config.json` (see [`pcsuite.example.json`](pcsuite.example.json));
-3. obviously-fake placeholder defaults that will not pair with a real phone.
+4. obviously-fake placeholder defaults that will not pair with a real phone.
 
 Copy `pcsuite.example.json` to `pcsuite.json` (git-ignored) and fill in your own
 values. Get the per-IP seed from the phone's `historyPhone` `ext.seeds`.
