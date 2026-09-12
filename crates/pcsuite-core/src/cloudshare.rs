@@ -219,6 +219,32 @@ pub enum CloudEvent {
     Failed { task_id: String, error: String },
 }
 
+impl CloudEvent {
+    /// Serialize in the same shape [`crate::filetrans::FileTransEvent`] uses, so
+    /// the app can feed cloud transfers and the two LAN paths into one handler.
+    /// `source` and `taskId` are extra keys that existing readers ignore.
+    ///
+    /// `None` for [`CloudEvent::FileDone`]: the shared shape has no per-file
+    /// event, and the UI reports batches, so forwarding it would only add noise.
+    pub fn to_file_trans_json(&self) -> Option<String> {
+        let v = match self {
+            CloudEvent::Started { task_id, files } => {
+                json!({"type": "started", "files": files, "source": "cloud", "taskId": task_id})
+            }
+            CloudEvent::Done { task_id, files, dir } => {
+                json!({"type": "done", "files": files, "dir": dir,
+                       "source": "cloud", "taskId": task_id})
+            }
+            CloudEvent::Failed { task_id, error } => {
+                json!({"type": "failed", "files": [], "error": error,
+                       "source": "cloud", "taskId": task_id})
+            }
+            CloudEvent::FileDone { .. } => return None,
+        };
+        Some(v.to_string())
+    }
+}
+
 /// A configured cloud-transfer client.
 pub struct CloudShare {
     account: Account,

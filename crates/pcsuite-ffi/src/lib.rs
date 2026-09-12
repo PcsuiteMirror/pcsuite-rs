@@ -289,6 +289,26 @@ mod ffi {
         fn pcsuite_cloud_devices() -> Result<String, String>;
         // Remove this PC from the account (the phone stops listing it).
         fn pcsuite_cloud_unregister() -> Result<String, String>;
+
+        // ── 云传输 (cloud transfer) receiver ──
+        //
+        // The third way the phone sends files here, and the only one that is not
+        // peer-to-peer: the phone uploads to vivo's relay and this PC downloads
+        // later, so it works with the two never on the same network. Needs
+        // account mode and a signed-in account; in serverless mode the poll loop
+        // runs but makes no request.
+        //
+        // Files land in `save_dir`. Events use the same JSON shape as
+        // pcsuite_share_recv_next_event, so the app can feed both into one
+        // handler. `interval_secs` is the background re-check period; the
+        // official client does not poll at all, so pick something lazy and call
+        // pcsuite_cloud_recv_poll_now() at the moments that matter (launch,
+        // sign-in, waking, connecting a phone).
+        fn pcsuite_cloud_recv_start(save_dir: String, interval_secs: f64) -> Result<(), String>;
+        fn pcsuite_cloud_recv_next_event() -> String;
+        // Check the relay immediately instead of waiting out the interval.
+        fn pcsuite_cloud_recv_poll_now();
+        fn pcsuite_cloud_recv_stop();
     }
 
     extern "Rust" {
@@ -1593,6 +1613,124 @@ fn pcsuite_cloud_unregister() -> Result<String, String> {
     let cc = cloud_center()?;
     rt().block_on(cc.unbind()).map_err(|e| format!("{e:#}"))?;
     Ok(cc.device_id().to_string())
+}
+
+// ── 云传输 (cloud transfer) receiver ──
+//
+// Unlike the 互传 listener above there is no socket to own: receiving is a poll
+// of the vendor's relay. So this is a background task rather than a listener,
+// with the same three-piece shape (task slot, event queue, stop flag) plus a
+// notify the app can ring to make the next check happen now.
+
+fn cloud_recv_slot() -> &'static std::sync::Mutex<Option<tokio::task::JoinHandle<()>>> {
+    static S: OnceLock<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>> = OnceLock::new();
+    S.get_or_init(Default::default)
+}
+
+fn cloud_recv_rx() -> &'static std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<String>>>
+{
+    static R: OnceLock<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<String>>>> =
+        OnceLock::new();
+    R.get_or_init(Default::default)
+}
+
+fn cloud_recv_stop_flag() -> &'static std::sync::atomic::AtomicBool {
+    static F: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    &F
+}
+
+/// Rung by [`pcsuite_cloud_recv_poll_now`] to cut the wait short.
+fn cloud_recv_wake() -> &'static tokio::sync::Notify {
+    static N: OnceLock<tokio::sync::Notify> = OnceLock::new();
+    N.get_or_init(Default::default)
+}
+
+/// One pass over the relay. Silent when there is nothing to do — including when
+/// the user is in serverless mode or not signed in, which is the normal state
+/// for most users and must not produce an error event on every tick.
+async fn cloud_recv_once(save_dir: &str, tx: &tokio::sync::mpsc::UnboundedSender<String>) {
+    if !config::mode().uses_cloud() {
+        return;
+    }
+    let account = cloud_account().read().unwrap().clone();
+    if !account.is_complete() {
+        return;
+    }
+    let client = match pcsuite_core::cloudshare::CloudShare::new(account) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::debug!(error = %e, "云传输: client unavailable");
+            return;
+        }
+    };
+
+    let tx = tx.clone();
+    let forward = move |ev: pcsuite_core::cloudshare::CloudEvent| {
+        if let Some(json) = ev.to_file_trans_json() {
+            let _ = tx.send(json);
+        }
+    };
+    if let Err(e) = client.receive_pending(save_dir, &forward).await {
+        // A failed *query* (offline, expired token) is not a transfer failure —
+        // log it rather than telling the user a file could not be received.
+        tracing::debug!(error = %format!("{e:#}"), "云传输: poll failed");
+    }
+}
+
+fn pcsuite_cloud_recv_start(save_dir: String, interval_secs: f64) -> Result<(), String> {
+    // Drop any previous poller before starting a new one.
+    if let Some(h) = cloud_recv_slot().lock().unwrap().take() {
+        h.abort();
+    }
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    cloud_recv_stop_flag().store(false, std::sync::atomic::Ordering::Relaxed);
+    *cloud_recv_rx().lock().unwrap() = Some(rx);
+
+    let interval = std::time::Duration::from_secs_f64(interval_secs.max(30.0));
+    let handle = rt().spawn(async move {
+        loop {
+            cloud_recv_once(&save_dir, &tx).await;
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {}
+                _ = cloud_recv_wake().notified() => {}
+            }
+        }
+    });
+    *cloud_recv_slot().lock().unwrap() = Some(handle);
+    Ok(())
+}
+
+/// Block for the next 云传输 event as JSON; "" once stopped (or never started).
+/// Same take-out/put-back dance as [`pcsuite_share_recv_next_event`].
+fn pcsuite_cloud_recv_next_event() -> String {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    let rx = cloud_recv_rx().lock().unwrap().take();
+    let Some(mut rx) = rx else { return String::new() };
+    let msg = rt().block_on(async {
+        loop {
+            if cloud_recv_stop_flag().load(Ordering::Relaxed) {
+                return None;
+            }
+            match tokio::time::timeout(Duration::from_millis(300), rx.recv()).await {
+                Ok(v) => return v,
+                Err(_) => continue,
+            }
+        }
+    });
+    *cloud_recv_rx().lock().unwrap() = Some(rx);
+    msg.unwrap_or_default()
+}
+
+fn pcsuite_cloud_recv_poll_now() {
+    cloud_recv_wake().notify_one();
+}
+
+fn pcsuite_cloud_recv_stop() {
+    cloud_recv_stop_flag().store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Some(h) = cloud_recv_slot().lock().unwrap().take() {
+        h.abort();
+    }
 }
 
 /// Cheap USB cable check — see [`pcsuite_core::usb::probe`]. Not cancellable: it

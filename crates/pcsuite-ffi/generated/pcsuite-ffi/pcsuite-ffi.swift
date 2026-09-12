@@ -70,6 +70,18 @@ public func pcsuite_cloud_devices() throws -> RustString {
 public func pcsuite_cloud_unregister() throws -> RustString {
     try { let val = __swift_bridge__$pcsuite_cloud_unregister(); if val.is_ok { return RustString(ptr: val.ok_or_err!) } else { throw RustString(ptr: val.ok_or_err!) } }()
 }
+public func pcsuite_cloud_recv_start<GenericIntoRustString: IntoRustString>(_ save_dir: GenericIntoRustString, _ interval_secs: Double) throws -> () {
+    try { let val = __swift_bridge__$pcsuite_cloud_recv_start({ let rustString = save_dir.intoRustString(); rustString.isOwned = false; return rustString.ptr }(), interval_secs); if val != nil { throw RustString(ptr: val!) } else { return } }()
+}
+public func pcsuite_cloud_recv_next_event() -> RustString {
+    RustString(ptr: __swift_bridge__$pcsuite_cloud_recv_next_event())
+}
+public func pcsuite_cloud_recv_poll_now() {
+    __swift_bridge__$pcsuite_cloud_recv_poll_now()
+}
+public func pcsuite_cloud_recv_stop() {
+    __swift_bridge__$pcsuite_cloud_recv_stop()
+}
 public func pcsuite_cloud_presence_start<GenericIntoRustString: IntoRustString>(_ phone_ip: GenericIntoRustString, _ remote: Bool) -> PcCloudPresence {
     PcCloudPresence(ptr: __swift_bridge__$pcsuite_cloud_presence_start({ let rustString = phone_ip.intoRustString(); rustString.isOwned = false; return rustString.ptr }(), remote))
 }
