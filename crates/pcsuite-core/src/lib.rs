@@ -32,6 +32,7 @@ pub use clipboard::{run_clipboard, ClipboardBackend, ClipboardConfig};
 pub use cloud::{Account, CloudDevice, ConnectCenter};
 pub use connect::{
     presence_once, register, ConnectAnswer, PresenceConfig, RegisterConfig, Registration,
+    UpgradeRequest,
 };
 pub use device::DeviceInfo;
 pub use filetrans::{FileTransConfig, FileTransEvent};

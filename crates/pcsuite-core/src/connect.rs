@@ -307,6 +307,72 @@ impl ConnectAnswer {
 /// tearing the link down under it.
 const CONNECT_ANSWER_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// A local request to turn the held pre-connect into a formal connect — i.e. *we*
+/// decided to connect (the user clicked connect in our own UI), rather than the phone
+/// asking. Same wire steps as the phone-initiated upgrade, minus the `[25]`/`[27]`
+/// answers, which only exist to answer the phone's request.
+///
+/// Going through the held connection matters: the phone keeps one 10191 per PC, so a
+/// second one (what a plain [`register`] does) closes the hold — the phone stops showing
+/// this PC as present for as long as our own session lasts.
+pub struct UpgradeRequest {
+    /// Gets the token registered on the held connection, or why it failed.
+    pub reply: oneshot::Sender<std::result::Result<String, String>>,
+    /// Fires when the resulting session ends, so the hold goes back to a plain
+    /// pre-connect (see [`ConnectAnswer::ended`]).
+    pub ended: oneshot::Receiver<()>,
+}
+
+/// Turn the held connection into a formal connect **in place**: device_info exchange,
+/// then `bytes:[0]` with a fresh token. Returns that token.
+///
+/// `ConnectFlow::start` does exactly this on the pre-connect it finds — its
+/// `connection_steps` spell the order out: `_PFD:0_WSR:0_WRR:0_WSR:0_WRR:0_WPR:0` (find
+/// pre-connect device, send/recv twice, parse reply; official Windows log, 2026-09-12).
+/// Skipping the device_info pair leaves the phone waiting — it shows 「正在连接」 and then
+/// 「连接失败」 even though the 10380 session is up.
+async fn upgrade_in_place(
+    sock: &mut TcpStream,
+    cfg: &PresenceConfig,
+    connect_type: i64,
+    seed: &str,
+) -> Result<String> {
+    let d = payload1::encode_json(&connect::device_info_frame(&cfg.identity, 22))?;
+    sock.write_all(&d).await?;
+    sock.flush().await?;
+    let re_ack = read_reply(sock, Duration::from_secs(8)).await;
+    tracing::info!(
+        code = ?re_ack.as_ref().and_then(connect::reply_code),
+        auth = ?re_ack.as_ref().and_then(connect::auth_status),
+        "presence: connect device_info reply"
+    );
+
+    let token = random_token();
+    let conn_id = official_conn_id();
+    // Lowercase, like the official `seed` (it is part of the sign key, so both sides
+    // just need the same string).
+    let seed_b = uuid::Uuid::new_v4().to_string();
+    let sign = pcsuite_crypto::make_sign(&cfg.identity.open_id, &conn_id, &token, seed, &seed_b);
+    // 680 = what the official formal connect sends here (`pcPcsuiteVersion:680`, with
+    // `isAutoConnect`/`isAutoConnectNew` both "0"). `register` keeps 620, the value its
+    // heavily-exercised mirror path was validated on.
+    let f = payload1::encode_json(&connect::connect_frame(
+        &cfg.identity,
+        &seed_b,
+        &sign,
+        connect_type,
+        false,
+        680,
+    ))?;
+    sock.write_all(&f).await?;
+    sock.flush().await?;
+    let code = read_reply(sock, Duration::from_secs(8))
+        .await
+        .and_then(|v| connect::reply_code(&v));
+    tracing::info!(?code, "presence: re-registered in place (bytes:[0])");
+    Ok(token)
+}
+
 /// A connection id shaped like the official desktop's — `<4 hex>_<epoch ms>`
 /// (Electron `pre-connect-mode`: `${createRandomStr(4)}_${Date.now()}`).
 fn official_conn_id() -> String {
@@ -320,6 +386,7 @@ pub async fn presence_once<F, G>(
     cfg: &PresenceConfig,
     on_ready: F,
     on_connect_request: G,
+    mut upgrade_rx: Option<&mut tokio::sync::mpsc::Receiver<UpgradeRequest>>,
 ) -> Result<()>
 where
     F: FnOnce(),
@@ -396,7 +463,57 @@ where
     // "connect" on the phone), which we surface for the caller to act on later.
     let mut tmp = [0u8; 8192];
     'hold: loop {
-        match sock.read(&mut tmp).await {
+        // A local connect (our own UI) rides this same connection: upgrade it in place
+        // and hand the token over, instead of opening a second 10191 the phone would
+        // answer by closing this one.
+        let local = async {
+            match upgrade_rx.as_deref_mut() {
+                Some(rx) => rx.recv().await,
+                None => std::future::pending().await,
+            }
+        };
+        let read = tokio::select! {
+            req = local => {
+                let Some(req) = req else {
+                    // The requester side is gone; keep holding.
+                    continue 'hold;
+                };
+                tracing::info!("presence: local connect → upgrade this connection in place");
+                match upgrade_in_place(&mut sock, cfg, connect_type, &seed).await {
+                    Ok(t) => {
+                        let mut ended = req.ended;
+                        if req.reply.send(Ok(t)).is_err() {
+                            continue 'hold;   // caller gave up
+                        }
+                        // Hold it for the session's lifetime, then go back to a plain
+                        // pre-connect so the phone stops showing us as connected.
+                        loop {
+                            tokio::select! {
+                                _ = &mut ended => {
+                                    tracing::info!(
+                                        "presence: local session ended → re-hold a fresh                                          pre-connect"
+                                    );
+                                    return Ok(());
+                                }
+                                n = sock.read(&mut tmp) => match n {
+                                    Ok(0) => return Ok(()),
+                                    Ok(_) => continue,
+                                    Err(e) => {
+                                        return Err(e).context("presence read (local session)")
+                                    }
+                                },
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = req.reply.send(Err(format!("{e:#}")));
+                        continue 'hold;
+                    }
+                }
+            }
+            n = sock.read(&mut tmp) => n,
+        };
+        match read {
             Ok(0) => {
                 tracing::info!("presence: phone closed the connection (EOF)");
                 return Ok(());
@@ -430,57 +547,7 @@ where
                         // service for (`preconnect_connect`, autoConnect "0") without
                         // giving up the connection the phone is waiting on.
                         let session_token = if cfg.reregister_on_ask {
-                            // `ConnectFlow::start` re-runs the device_info exchange on
-                            // this same channel *before* the connect frame — its
-                            // `connection_steps` spell it out:
-                            // `_PFD:0_WSR:0_WRR:0_WSR:0_WRR:0_WPR:0` = find preconnect
-                            // device, send/recv twice, parse reply (official Windows
-                            // log, 2026-09-12). Skipping it leaves the phone waiting:
-                            // it shows 「正在连接」 and then 「连接失败」 even though the
-                            // 10380 session is up.
-                            let d = payload1::encode_json(&connect::device_info_frame(
-                                &cfg.identity,
-                                22,
-                            ))?;
-                            sock.write_all(&d).await?;
-                            sock.flush().await?;
-                            let re_ack = read_reply(&mut sock, Duration::from_secs(8)).await;
-                            tracing::info!(
-                                code = ?re_ack.as_ref().and_then(connect::reply_code),
-                                auth = ?re_ack.as_ref().and_then(connect::auth_status),
-                                "presence: connect device_info reply"
-                            );
-                            let t = random_token();
-                            let cid = official_conn_id();
-                            // Lowercase, like the official `seed` (it is part of the
-                            // sign key, so both sides just need the same string).
-                            let sb = uuid::Uuid::new_v4().to_string();
-                            let sg = pcsuite_crypto::make_sign(
-                                &cfg.identity.open_id,
-                                &cid,
-                                &t,
-                                &seed,
-                                &sb,
-                            );
-                            // 680 = what the official formal connect sends here
-                            // (`pcPcsuiteVersion:680` with `isAutoConnect`/
-                            // `isAutoConnectNew` both "0"). `register` keeps 620, the
-                            // value its heavily-exercised mirror path was validated on.
-                            let f = payload1::encode_json(&connect::connect_frame(
-                                &cfg.identity,
-                                &sb,
-                                &sg,
-                                connect_type,
-                                false,
-                                680,
-                            ))?;
-                            sock.write_all(&f).await?;
-                            sock.flush().await?;
-                            let code = read_reply(&mut sock, Duration::from_secs(8))
-                                .await
-                                .and_then(|v| connect::reply_code(&v));
-                            tracing::info!(?code, "presence: re-registered in place (bytes:[0])");
-                            t
+                            upgrade_in_place(&mut sock, cfg, connect_type, &seed).await?
                         } else {
                             token.clone()
                         };

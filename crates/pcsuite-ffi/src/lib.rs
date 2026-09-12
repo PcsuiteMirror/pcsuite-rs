@@ -319,6 +319,10 @@ mod ffi {
         // discoverable one). Without this the phone keeps showing 「已连接」 with
         // function buttons that do nothing. Idempotent.
         fn report_session_ended(&self);
+        // Upgrade the held connection for a connect WE start, returning the token to
+        // open 10380 with (pcsuite_connect_lan_token); "" = nothing to upgrade, use
+        // pcsuite_connect_lan instead. Pair it with report_session_ended when done.
+        fn upgrade_for_connect(&self) -> String;
         // Stop holding the connection (idempotent). The task ends and status
         // becomes "stopped"; the phone reverts to 「未发现」 on its next refresh.
         fn stop(&self);
@@ -1148,6 +1152,9 @@ pub struct PcCloudPresence {
     /// Fired by `report_session_ended`: tells presence that the session it upgraded this
     /// connection for is over, so it drops it and goes back to a plain discoverable hold.
     session_ended: std::sync::Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+    /// Our *own* connects go through here: presence upgrades the connection it is
+    /// holding and hands back the token (see `upgrade_for_connect`).
+    upgrade_tx: tokio::sync::mpsc::Sender<pcsuite_core::UpgradeRequest>,
     stop_tx: tokio::sync::watch::Sender<bool>,
     task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -1184,6 +1191,40 @@ impl PcCloudPresence {
         }
     }
 
+    /// Ask presence to turn the connection it is holding into a formal connect for a
+    /// connect **we** initiated, returning the token to open 10380 with
+    /// (`pcsuite_connect_lan_token`). Empty string = no hold to upgrade (or it failed);
+    /// fall back to `pcsuite_connect_lan`, which registers on its own connection.
+    ///
+    /// Going through the hold is what keeps the phone showing this PC as connected: a
+    /// second 10191 makes it close the held one.
+    fn upgrade_for_connect(&self) -> String {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let (ended_tx, ended_rx) = tokio::sync::oneshot::channel();
+        let req = pcsuite_core::UpgradeRequest { reply: reply_tx, ended: ended_rx };
+        let token = rt().block_on(async {
+            if self.upgrade_tx.send(req).await.is_err() {
+                return None;   // presence task is gone
+            }
+            match tokio::time::timeout(std::time::Duration::from_secs(15), reply_rx).await {
+                Ok(Ok(Ok(t))) => Some(t),
+                Ok(Ok(Err(e))) => {
+                    tracing::info!(err = %e, "presence: in-place upgrade failed");
+                    None
+                }
+                _ => None,
+            }
+        });
+        match token {
+            Some(t) => {
+                // The session rides the hold now: remember how to end it.
+                *self.session_ended.lock().unwrap() = Some(ended_tx);
+                t
+            }
+            None => String::new(),
+        }
+    }
+
     /// Tell presence the session the phone asked for has ended (disconnected, dropped, or
     /// the user ended it here). Presence then drops the connection it upgraded and
     /// re-holds a fresh pre-connect, so the phone goes back to 「可连」 instead of showing
@@ -1215,6 +1256,7 @@ fn pcsuite_cloud_presence_start(phone_ip: String, remote: bool) -> PcCloudPresen
     let connect_requested: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let answer: AnswerSlot = Arc::new(Mutex::new(None));
     let session_ended = Arc::new(Mutex::new(None));
+    let (upgrade_tx, mut upgrade_rx) = tokio::sync::mpsc::channel::<pcsuite_core::UpgradeRequest>(1);
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
 
     // The LAN sign must carry the account's openId (the phone rejects a mismatch
@@ -1237,6 +1279,7 @@ fn pcsuite_cloud_presence_start(phone_ip: String, remote: bool) -> PcCloudPresen
             connect_requested,
             answer,
             session_ended,
+            upgrade_tx,
             stop_tx,
             task: None,
         };
@@ -1288,6 +1331,7 @@ fn pcsuite_cloud_presence_start(phone_ip: String, remote: bool) -> PcCloudPresen
                     *req.lock().unwrap() = Some(token.to_string());
                     rx
                 },
+                Some(&mut upgrade_rx),
             );
             tokio::select! {
                 // The hold only ends when the phone closes it (or on error) — an
@@ -1318,6 +1362,7 @@ fn pcsuite_cloud_presence_start(phone_ip: String, remote: bool) -> PcCloudPresen
         connect_requested,
         answer,
         session_ended,
+        upgrade_tx,
         stop_tx,
         task: Some(task),
     }

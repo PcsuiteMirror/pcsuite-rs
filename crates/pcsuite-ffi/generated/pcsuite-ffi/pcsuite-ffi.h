@@ -118,6 +118,7 @@ void* __swift_bridge__$PcCloudPresence$status(void* self);
 void* __swift_bridge__$PcCloudPresence$take_connect_request(void* self);
 void __swift_bridge__$PcCloudPresence$report_connect_result(void* self, int64_t ret_code, void* ret_msg);
 void __swift_bridge__$PcCloudPresence$report_session_ended(void* self);
+void* __swift_bridge__$PcCloudPresence$upgrade_for_connect(void* self);
 void __swift_bridge__$PcCloudPresence$stop(void* self);
 void* __swift_bridge__$PcPairing$qr_url(void* self);
 void* __swift_bridge__$PcPairing$lan_ip(void* self);

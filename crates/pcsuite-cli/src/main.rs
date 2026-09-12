@@ -1418,6 +1418,7 @@ async fn cmd_cloud_presence(args: &Args) -> Result<()> {
                     let _ = req_tx.send((token.to_string(), tx));
                     rx
                 },
+                None,   // `cloud presence` has no local connect of its own
             )
             .await
             {
