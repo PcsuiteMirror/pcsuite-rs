@@ -282,6 +282,27 @@ where
     }
 }
 
+/// A spawned task that is aborted when the guard drops, unless [`take`n](Self::take)
+/// out first. Dropping a bare `JoinHandle` only detaches the task; this makes an
+/// early return actually cancel it.
+struct AbortOnDrop<T>(Option<JoinHandle<T>>);
+
+impl<T> AbortOnDrop<T> {
+    /// Remove the handle so it survives the guard (the caller now owns its
+    /// lifetime — e.g. to `.await` it).
+    fn take(&mut self) -> Option<JoinHandle<T>> {
+        self.0.take()
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(h) = &self.0 {
+            h.abort();
+        }
+    }
+}
+
 /// One 互传 session: connect frame → reply → WS v1 exchange → zip → done.
 /// `committed` is flipped once the phone has announced a task and the download
 /// is underway, so [`accept_loop`] knows this session must not be superseded.
@@ -311,7 +332,15 @@ where
     // The task must run the *whole* WS session, not just the connect: the phone
     // pushes `versionNegotiation` within ~2ms of the socket attaching and closes
     // it again if that goes unanswered while we are still busy replying on 10191.
-    let session = run_session.then(|| {
+    // Abort-on-drop: if this fn returns before taking the handle back out — the
+    // connect frame never arrives (a port probe, a stray local connection that
+    // closes at once, as `peer closed before connect frame`), or the frame's
+    // service_id is wrong — the hunt must stop with it. A bare JoinHandle only
+    // *detaches* on drop, so without this the poller would keep hammering the
+    // phone's 8080 every WS_POLL_INTERVAL for the whole 90s WS_WINDOW (~900
+    // `share server not reachable yet` lines) for a connection that was never a
+    // transfer.
+    let mut session = AbortOnDrop(run_session.then(|| {
         let ip = phone_ip.to_string();
         let save_dir = cfg.save_dir.clone();
         let ev = on_event.clone();
@@ -328,7 +357,7 @@ where
             )
             .await
         })
-    });
+    }));
 
     let body = read_first_frame(&mut sock).await?;
     let v: Value = serde_json::from_slice(&body).context("互传 connect frame was not JSON")?;
@@ -393,7 +422,7 @@ where
     // in a successful run `saved` is logged *before* this frame goes out — but a
     // 157MB pull was still streaming and died with `early eof` / `EOF inside
     // chunked stream`, and the phone's device row showed「发送失败」.
-    let outcome = match session {
+    let outcome = match session.take() {
         Some(handle) => handle.await.context("互传: session task did not finish")?,
         None => {
             sock.write_all(&accept_frame).await.context("send accept frame")?;
