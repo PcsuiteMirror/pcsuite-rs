@@ -854,13 +854,32 @@ pub(crate) fn spawn_watcher(
     tokio::spawn(async move { watcher(shared, backend, device_name).await })
 }
 
+/// How long to wait for the phone's key before re-sending `startup`, and how
+/// many times to re-send. A phone that answers does so within ~0.5s even over
+/// Tailscale; one that stays silent past this has lost the message on its side.
+/// `resolve_device_id` in the FFI waits out this whole window before it gives
+/// up on the device id, so keep the two in step.
+pub const SHADOW_REPLY_WAIT: Duration = Duration::from_secs(3);
+pub const SHADOW_STARTUP_RESENDS: u32 = 2;
+
 /// Drive the SHADOW_LIKE handshake over a shared control channel: send `startup`,
 /// wait for the phone's key/iv, store them, send `ready`.
+///
+/// The reply comes from the phone's separate vdfs service, which PCSuite only
+/// forwards our `startup` to once vdfs has (re)bound and registered its callback
+/// — and that registration is torn down with every session. Seen on a real
+/// phone: a session closed and reopened a few seconds later got no reply at all,
+/// and the clipboard stayed dead until the user reconnected by hand. So a
+/// `startup` that goes unanswered is re-sent — the **same** message, same key/iv:
+/// rotating them is what a competing startup must never do, and re-parsing an
+/// identical one is idempotent on the phone (it resets its PC record and answers
+/// again with its own stable key). After the last re-send we keep listening,
+/// as before: a late answer is still an answer.
 pub(crate) async fn clip_handshake(control: ControlHandle, shared: SharedRef, startup_msg: String) {
     use tokio::sync::broadcast::error::RecvError;
     // Subscribe before sending, so we can't miss a reply to our own startup...
     let mut rx = control.subscribe();
-    let _ = control.send(startup_msg).await;
+    let _ = control.send(startup_msg.clone()).await;
     // ...but the phone may have announced its key *before* we subscribed, so also
     // check the retained last-SHADOW_LIKE.
     if let Some(t) = control.last_shadow() {
@@ -868,8 +887,36 @@ pub(crate) async fn clip_handshake(control: ControlHandle, shared: SharedRef, st
             return;
         }
     }
+    let mut resent = 0u32;
+    // A fixed deadline, not a per-message timeout: the phone echoes other
+    // control text (our own startup among it) and that must not keep pushing
+    // the re-send out.
+    let mut deadline = tokio::time::Instant::now() + SHADOW_REPLY_WAIT;
     loop {
-        match rx.recv().await {
+        let next = if resent < SHADOW_STARTUP_RESENDS {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(r) => r,
+                Err(_) => {
+                    resent += 1;
+                    tracing::warn!(
+                        attempt = resent + 1,
+                        "clipboard: no phone key within {}s — re-sending SHADOW_LIKE startup (same key/iv)",
+                        SHADOW_REPLY_WAIT.as_secs()
+                    );
+                    let _ = control.send(startup_msg.clone()).await;
+                    deadline = tokio::time::Instant::now() + SHADOW_REPLY_WAIT;
+                    if resent == SHADOW_STARTUP_RESENDS {
+                        tracing::warn!(
+                            "clipboard: last re-send; if the phone stays silent the clipboard is off for this session (reconnect to retry)"
+                        );
+                    }
+                    continue;
+                }
+            }
+        } else {
+            rx.recv().await
+        };
+        match next {
             Ok(t) => {
                 if apply_shadow(&control, &shared, &t).await {
                     return;

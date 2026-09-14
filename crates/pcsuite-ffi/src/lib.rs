@@ -993,16 +993,27 @@ impl PcSession {
                 }
                 // With clipboard active a startup is in flight; wait for its reply
                 // rather than sending our own (a second startup rotates the clipboard
-                // keys mid-handshake → phone→PC sync dies). Poll the retained reply.
+                // keys mid-handshake → phone→PC sync dies). Poll the retained reply
+                // for as long as the handshake keeps re-sending its startup (plus a
+                // second for the last answer to land), so a phone that only answers
+                // the second or third startup still yields the device id.
                 if clip_active {
-                    for _ in 0..50 {
+                    let window = pcsuite_core::clipboard::SHADOW_REPLY_WAIT
+                        * (pcsuite_core::clipboard::SHADOW_STARTUP_RESENDS + 1)
+                        + std::time::Duration::from_secs(1);
+                    let polls = window.as_millis() / 100;
+                    for _ in 0..polls {
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         let s = self.session.lock().await;
                         if let Some(id) = s.known_device_id() {
                             return Ok(id);
                         }
                     }
-                    anyhow::bail!("device id unavailable: clipboard handshake produced no SHADOW reply within 5s (not sending a competing startup, which would rotate the clipboard keys)");
+                    anyhow::bail!(
+                        "device id unavailable: clipboard handshake produced no SHADOW reply within {}s, startup re-sent {} times (not sending a competing startup, which would rotate the clipboard keys)",
+                        window.as_secs(),
+                        pcsuite_core::clipboard::SHADOW_STARTUP_RESENDS
+                    );
                 }
                 // No clipboard in flight (e.g. browse-only) → safe to ask ourselves.
                 let s = self.session.lock().await;
