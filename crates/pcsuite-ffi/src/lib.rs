@@ -1771,14 +1771,17 @@ fn pcsuite_connect_usb() -> Result<PcSession, String> {
             ..UsbConfig::default()
         })
         .await?;
-        // Best-effort, bounded: announce our display name *before* the WS comes
-        // up (which freezes the phone's "已连接" notification text). USB has no
-        // earlier name channel that reaches that notification; failures are
-        // harmless (the post-connect device-info fetch still sets the in-app
-        // name). Time-boxed so it can never stall the connect.
+        // Best-effort, bounded: the official pre-WS `/version` + full `/base-info`
+        // (the same pair the LAN path sends). It must land *before* the WS comes
+        // up: it carries our display name, which the phone freezes into its
+        // "已连接" notification then, and `isLogin`/`openid`/`pcSystemType="2"`,
+        // without which the phone's connection center doesn't count this as a
+        // connection — it keeps offering 「连接」 and routes phone→PC file shares
+        // through 云传输 instead of this session. Time-boxed so it can never
+        // stall the connect.
         let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            pcsuite_core::device::announce_pc_name("127.0.0.1", &u.token, &id.device_name),
+            std::time::Duration::from_secs(5),
+            pcsuite_core::pre_ws_probe("127.0.0.1", &u.token, &u.conn_id),
         )
         .await;
         let session = Session::connect("127.0.0.1", &u.token).await?;

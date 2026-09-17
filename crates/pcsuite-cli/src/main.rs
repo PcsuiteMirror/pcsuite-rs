@@ -359,6 +359,14 @@ async fn resolve_transport(args: &Args, feature: &str) -> Result<Transport> {
             ..UsbConfig::default()
         })
         .await?;
+        // Full `/version` + `/base-info` before the WS, as on LAN: without the
+        // account fields the phone's connection center doesn't count a USB
+        // session as connected (and sends file shares via 云传输).
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            pcsuite_core::pre_ws_probe("127.0.0.1", &session.token, &session.conn_id),
+        )
+        .await;
         Ok(Transport {
             data_ip: "127.0.0.1".into(),
             token: session.token,
