@@ -25,6 +25,18 @@ void* __swift_bridge__$Vec_PcSession$get_mut(void* vec_ptr, uintptr_t index);
 uintptr_t __swift_bridge__$Vec_PcSession$len(void* vec_ptr);
 void* __swift_bridge__$Vec_PcSession$as_ptr(void* vec_ptr);
 
+typedef struct PcDownload PcDownload;
+void __swift_bridge__$PcDownload$_free(void* self);
+
+void* __swift_bridge__$Vec_PcDownload$new(void);
+void __swift_bridge__$Vec_PcDownload$drop(void* vec_ptr);
+void __swift_bridge__$Vec_PcDownload$push(void* vec_ptr, void* item_ptr);
+void* __swift_bridge__$Vec_PcDownload$pop(void* vec_ptr);
+void* __swift_bridge__$Vec_PcDownload$get(void* vec_ptr, uintptr_t index);
+void* __swift_bridge__$Vec_PcDownload$get_mut(void* vec_ptr, uintptr_t index);
+uintptr_t __swift_bridge__$Vec_PcDownload$len(void* vec_ptr);
+void* __swift_bridge__$Vec_PcDownload$as_ptr(void* vec_ptr);
+
 typedef struct PcCloudPresence PcCloudPresence;
 void __swift_bridge__$PcCloudPresence$_free(void* self);
 
@@ -92,6 +104,18 @@ bool __swift_bridge__$PcSession$delete_surrounding(void* self, int64_t before, i
 bool __swift_bridge__$PcSession$tap(void* self, int64_t x, int64_t y, int64_t w, int64_t h);
 bool __swift_bridge__$PcSession$key(void* self, int64_t keycode);
 bool __swift_bridge__$PcSession$set_audio_to_pc(void* self, bool to_pc);
+struct __private__ResultPtrAndPtr __swift_bridge__$PcSession$list_dir(void* self, void* dir, uint32_t page_index, uint32_t page_number);
+struct __private__ResultPtrAndPtr __swift_bridge__$PcSession$list_category(void* self, void* kind);
+struct __private__ResultPtrAndPtr __swift_bridge__$PcSession$list_albums(void* self);
+struct __private__ResultPtrAndPtr __swift_bridge__$PcSession$list_album(void* self, void* key_id, void* bucket_ids);
+struct __private__ResultPtrAndPtr __swift_bridge__$PcSession$create_directory(void* self, void* parent, void* name);
+struct __private__ResultPtrAndPtr __swift_bridge__$PcSession$rename_path(void* self, void* path, void* new_name);
+struct __private__ResultPtrAndPtr __swift_bridge__$PcSession$delete_paths(void* self, void* paths);
+uint64_t __swift_bridge__$PcSession$directory_size(void* self, void* path);
+struct __swift_bridge__$ResultU32AndString __swift_bridge__$PcSession$fetch_thumbnails(void* self, void* paths, void* out_files);
+void* __swift_bridge__$PcSession$start_download(void* self, void* items_json, void* out_dir);
+void* __swift_bridge__$PcDownload$status(void* self);
+void __swift_bridge__$PcDownload$cancel(void* self);
 void __swift_bridge__$pcsuite_log_init(void);
 uint32_t __swift_bridge__$pcsuite_abi_version(void);
 void __swift_bridge__$pcsuite_set_identity(void* open_id, void* pc_mac, void* account, void* device_name);
@@ -138,5 +162,8 @@ void* __swift_bridge__$PcPaired$device_name(void* self);
 void* __swift_bridge__$PcPaired$vivo_account(void* self);
 void* __swift_bridge__$PcPaired$device_type(void* self);
 struct __private__ResultPtrAndPtr __swift_bridge__$PcPaired$connect(void* self);
+typedef enum __swift_bridge__$ResultU32AndString$Tag {__swift_bridge__$ResultU32AndString$ResultOk, __swift_bridge__$ResultU32AndString$ResultErr} __swift_bridge__$ResultU32AndString$Tag;
+union __swift_bridge__$ResultU32AndString$Fields {uint32_t ok; void* err;};
+typedef struct __swift_bridge__$ResultU32AndString{__swift_bridge__$ResultU32AndString$Tag tag; union __swift_bridge__$ResultU32AndString$Fields payload;} __swift_bridge__$ResultU32AndString;
 
 

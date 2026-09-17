@@ -132,7 +132,7 @@ mod ffi {
         // drop_files_info + a streamed tar over the 10380 HTTP gateway. `save_dir`
         // is the phone-side target directory ("" = the phone's default, observed
         // "Download/vivo办公套件/"); duplicates are renamed, never overwritten.
-        // Directories are rejected (v1: regular files only). Blocks for the whole
+        // Folders upload with everything inside them. Blocks for the whole
         // transfer — call off the main thread. Returns the phone-side directory
         // the files landed in.
         fn push_files(&self, paths: Vec<String>, save_dir: String) -> Result<String, String>;
@@ -196,6 +196,52 @@ mod ffi {
         // starts sending AAC (poll next_audio_frame); false: it stops sending and
         // its speaker comes back. Needs start_screen() first (rides /mirror/control).
         fn set_audio_to_pc(&self, to_pc: bool) -> bool;
+
+        // ── Phone file browser (mdfs HTTP on the 10380 gateway) ──
+        // None of these touch the control WS, so they run alongside mirroring and
+        // clipboard. All block on network I/O — call off the main thread.
+        //
+        // One page of a phone directory ("/" = the storage root, which also lists
+        // shortcuts such as 下载/音乐). Returns JSON:
+        //   {"total":N,"entries":[{"name","path","size","isDir","mime","date"(epoch ms),"duration"(ms)}]}
+        fn list_dir(&self, dir: String, page_index: u32, page_number: u32) -> Result<String, String>;
+        // A media category: recent|video|audio|doc|image|file, every page of it.
+        // Same JSON as list_dir.
+        fn list_category(&self, kind: String) -> Result<String, String>;
+        // The phone's photo albums as JSON:
+        //   [{"keyId","name","count","bucketIds":[…],"cover":"<phone path>"}]
+        fn list_albums(&self) -> Result<String, String>;
+        // Every item of one album (keyId + bucketIds from list_albums). Same JSON as list_dir.
+        fn list_album(&self, key_id: String, bucket_ids: Vec<String>) -> Result<String, String>;
+        // Create folder `name` inside `parent`; returns the new folder's path.
+        // An existing name fails with a message containing "already exists".
+        fn create_directory(&self, parent: String, name: String) -> Result<String, String>;
+        // Rename a file or folder in place; returns the new path. Same
+        // "already exists" failure as create_directory.
+        fn rename_path(&self, path: String, new_name: String) -> Result<String, String>;
+        // Delete files and folders. Returns JSON {"total":N,"deleted":N}.
+        fn delete_paths(&self, paths: Vec<String>) -> Result<String, String>;
+        // Total size in bytes of everything under a phone folder; 0 when the phone
+        // can't say (it only feeds a progress bar).
+        fn directory_size(&self, path: String) -> u64;
+        // Thumbnails for `paths`, written to the matching `out_files` (same length).
+        // Paths with no thumbnail (non-media files) are left unwritten. Returns how
+        // many files were written.
+        fn fetch_thumbnails(&self, paths: Vec<String>, out_files: Vec<String>) -> Result<u32, String>;
+        // Start downloading phone files/folders into `out_dir`, streaming to disk.
+        // `items_json` = [{"path":"…","isDir":bool,"size":N}]. Returns at once; poll
+        // the PcDownload for progress.
+        fn start_download(&self, items_json: String, out_dir: String) -> PcDownload;
+    }
+
+    extern "Rust" {
+        type PcDownload;
+        // Snapshot as JSON: {"state":"running"|"done"|"failed"|"cancelled",
+        //   "bytes":N, "paths":[local top-level paths], "error":"…"}.
+        // Non-blocking.
+        fn status(&self) -> String;
+        // Abort the transfer; the half-written file is removed. State → cancelled.
+        fn cancel(&self);
     }
 
     extern "Rust" {
@@ -828,34 +874,10 @@ impl PcSession {
     }
 
     fn push_files(&self, paths: Vec<String>, save_dir: String) -> Result<String, String> {
-        use anyhow::Context;
-        if paths.is_empty() {
+        let paths: Vec<std::path::PathBuf> = paths.iter().map(std::path::PathBuf::from).collect();
+        let items = pcsuite_core::mdfs::upload_items(&paths).map_err(|e| format!("{e:#}"))?;
+        if items.is_empty() {
             return Err("nothing to upload".to_string());
-        }
-        let mut items = Vec::with_capacity(paths.len());
-        for f in &paths {
-            let p = std::path::Path::new(f);
-            let md = std::fs::metadata(p).map_err(|e| format!("stat {f}: {e}"))?;
-            if !md.is_file() {
-                return Err(format!("{f}: 目录上传暂不支持，请只传普通文件"));
-            }
-            let name = p
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .with_context(|| format!("{f}: 无法取文件名"))
-                .map_err(|e| format!("{e:#}"))?;
-            let mtime_ms = md
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0);
-            items.push(pcsuite_core::mdfs::UploadItem {
-                local: p.to_path_buf(),
-                name,
-                size: md.len(),
-                mtime_ms,
-            });
         }
         let device_id = self.resolve_device_id()?;
         rt().block_on(pcsuite_core::mdfs::upload_files(
@@ -1157,6 +1179,251 @@ fn pcsuite_log_init() {
         .with_writer(std::io::stderr)
         .with_ansi(std::io::stderr().is_terminal())
         .try_init();
+}
+
+// ─────────────────────────── file browser ───────────────────────────
+
+/// Page size for category and album listings.
+const PAGE: u32 = 500;
+/// Stop paging here: a phone with more photos than this is better served by folders.
+const MAX_LISTED: usize = 20_000;
+
+/// Fetch page 0, 1, … until one comes back short (the phone's `totalCount` on
+/// grouped replies is only the page's own count, so it can't be trusted).
+fn collect_pages<F, Fut>(mut page: F) -> Result<Vec<pcsuite_core::FileEntry>, String>
+where
+    F: FnMut(u32) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<Vec<pcsuite_core::FileEntry>>>,
+{
+    let mut all = Vec::new();
+    for index in 0.. {
+        let rows = rt().block_on(page(index)).map_err(|e| format!("{e:#}"))?;
+        let short = rows.len() < PAGE as usize;
+        all.extend(rows);
+        if short || all.len() >= MAX_LISTED {
+            break;
+        }
+    }
+    Ok(all)
+}
+
+fn entries_json(entries: &[pcsuite_core::FileEntry], total: u64) -> String {
+    let rows: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "name": e.name,
+                "path": e.path,
+                "size": e.size,
+                "isDir": e.is_dir,
+                "mime": e.mime,
+                "date": e.date_ms,
+                "duration": e.duration_ms,
+            })
+        })
+        .collect();
+    serde_json::json!({ "total": total, "entries": rows }).to_string()
+}
+
+impl PcSession {
+    fn list_dir(&self, dir: String, page_index: u32, page_number: u32) -> Result<String, String> {
+        let device_id = self.resolve_device_id()?;
+        let page = rt()
+            .block_on(pcsuite_core::mdfs::list_dir(
+                &self.data_ip,
+                &self.token,
+                &device_id,
+                &dir,
+                page_index,
+                page_number,
+            ))
+            .map_err(|e| format!("{e:#}"))?;
+        Ok(entries_json(&page.entries, page.total))
+    }
+
+    fn list_category(&self, kind: String) -> Result<String, String> {
+        let kind = pcsuite_core::ListKind::parse(&kind).ok_or_else(|| format!("unknown category {kind:?}"))?;
+        let device_id = self.resolve_device_id()?;
+        let entries = collect_pages(|page| {
+            pcsuite_core::mdfs::list(&self.data_ip, &self.token, &device_id, kind, page, PAGE)
+        })?;
+        Ok(entries_json(&entries, entries.len() as u64))
+    }
+
+    fn list_albums(&self) -> Result<String, String> {
+        let device_id = self.resolve_device_id()?;
+        let albums = rt()
+            .block_on(pcsuite_core::mdfs::albums(&self.data_ip, &self.token, &device_id))
+            .map_err(|e| format!("{e:#}"))?;
+        let rows: Vec<serde_json::Value> = albums
+            .iter()
+            .map(|a| {
+                serde_json::json!({
+                    "keyId": a.key_id,
+                    "name": a.name,
+                    "count": a.count,
+                    "bucketIds": a.bucket_ids,
+                    "cover": a.cover_path,
+                })
+            })
+            .collect();
+        Ok(serde_json::Value::Array(rows).to_string())
+    }
+
+    fn list_album(&self, key_id: String, bucket_ids: Vec<String>) -> Result<String, String> {
+        let device_id = self.resolve_device_id()?;
+        let album = pcsuite_core::mdfs::Album {
+            key_id,
+            name: String::new(),
+            count: 0,
+            bucket_ids,
+            cover_path: String::new(),
+        };
+        let entries = collect_pages(|page| {
+            pcsuite_core::mdfs::album_page(&self.data_ip, &self.token, &device_id, &album, page, PAGE)
+        })?;
+        Ok(entries_json(&entries, entries.len() as u64))
+    }
+
+    fn create_directory(&self, parent: String, name: String) -> Result<String, String> {
+        let device_id = self.resolve_device_id()?;
+        rt().block_on(pcsuite_core::mdfs::create_directory(&self.data_ip, &self.token, &device_id, &parent, &name))
+            .map_err(|e| format!("{e:#}"))
+    }
+
+    fn rename_path(&self, path: String, new_name: String) -> Result<String, String> {
+        let device_id = self.resolve_device_id()?;
+        rt().block_on(pcsuite_core::mdfs::rename(&self.data_ip, &self.token, &device_id, &path, &new_name))
+            .map_err(|e| format!("{e:#}"))
+    }
+
+    fn delete_paths(&self, paths: Vec<String>) -> Result<String, String> {
+        let device_id = self.resolve_device_id()?;
+        let r = rt()
+            .block_on(pcsuite_core::mdfs::delete(&self.data_ip, &self.token, &device_id, &paths))
+            .map_err(|e| format!("{e:#}"))?;
+        Ok(serde_json::json!({ "total": r.total, "deleted": r.deleted }).to_string())
+    }
+
+    fn directory_size(&self, path: String) -> u64 {
+        let Ok(device_id) = self.resolve_device_id() else { return 0 };
+        rt().block_on(pcsuite_core::mdfs::directory_size(&self.data_ip, &self.token, &device_id, &path))
+            .unwrap_or_else(|e| {
+                tracing::warn!("directory_size {path}: {e:#}");
+                0
+            })
+    }
+
+    fn fetch_thumbnails(&self, paths: Vec<String>, out_files: Vec<String>) -> Result<u32, String> {
+        if paths.len() != out_files.len() {
+            return Err("paths and out_files differ in length".to_string());
+        }
+        let device_id = self.resolve_device_id()?;
+        let thumbs = rt()
+            .block_on(pcsuite_core::mdfs::thumbnails(&self.data_ip, &self.token, &device_id, &paths))
+            .map_err(|e| format!("{e:#}"))?;
+        let mut written = 0;
+        for ((_, bytes), out) in thumbs.iter().zip(&out_files) {
+            if bytes.is_empty() {
+                continue;
+            }
+            let out = std::path::Path::new(out);
+            if let Some(dir) = out.parent() {
+                std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+            }
+            std::fs::write(out, bytes).map_err(|e| format!("write {}: {e}", out.display()))?;
+            written += 1;
+        }
+        Ok(written)
+    }
+
+    fn start_download(&self, items_json: String, out_dir: String) -> PcDownload {
+        let dl = PcDownload::default();
+        let items: Vec<pcsuite_core::mdfs::DownloadItem> = match serde_json::from_str::<Vec<serde_json::Value>>(&items_json) {
+            Ok(rows) => rows
+                .iter()
+                .filter_map(|r| {
+                    Some(pcsuite_core::mdfs::DownloadItem {
+                        path: r.get("path")?.as_str()?.to_string(),
+                        is_dir: r.get("isDir").and_then(serde_json::Value::as_bool).unwrap_or(false),
+                        size: r.get("size").and_then(serde_json::Value::as_u64).unwrap_or(0),
+                    })
+                })
+                .collect(),
+            Err(e) => {
+                dl.finish(Err(format!("bad items json: {e}")));
+                return dl;
+            }
+        };
+        let device_id = match self.resolve_device_id() {
+            Ok(id) => id,
+            Err(e) => {
+                dl.finish(Err(e));
+                return dl;
+            }
+        };
+        let (host, token, shared) = (self.data_ip.clone(), self.token.clone(), dl.shared.clone());
+        rt().spawn(async move {
+            let progress = {
+                let shared = shared.clone();
+                move |n| shared.bytes.store(n, std::sync::atomic::Ordering::Relaxed)
+            };
+            let r = pcsuite_core::mdfs::download_to_dir(
+                &host,
+                &token,
+                &device_id,
+                &items,
+                std::path::Path::new(&out_dir),
+                progress,
+                shared.cancel.clone(),
+            )
+            .await;
+            let r = r
+                .map(|paths| paths.iter().map(|p| p.to_string_lossy().into_owned()).collect())
+                .map_err(|e| format!("{e:#}"));
+            PcDownload { shared }.finish(r);
+        });
+        dl
+    }
+}
+
+/// One running download started by [`PcSession::start_download`]. The transfer
+/// runs on the shared runtime; this is only a window onto it, so dropping the
+/// handle doesn't stop it — call [`PcDownload::cancel`].
+#[derive(Default)]
+pub struct PcDownload {
+    shared: std::sync::Arc<DownloadShared>,
+}
+
+#[derive(Default)]
+struct DownloadShared {
+    bytes: std::sync::atomic::AtomicU64,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    // None while running.
+    outcome: std::sync::Mutex<Option<Result<Vec<String>, String>>>,
+}
+
+impl PcDownload {
+    fn finish(&self, r: Result<Vec<String>, String>) {
+        *self.shared.outcome.lock().unwrap() = Some(r);
+    }
+
+    fn status(&self) -> String {
+        use std::sync::atomic::Ordering;
+        let bytes = self.shared.bytes.load(Ordering::Relaxed);
+        let cancelled = self.shared.cancel.load(Ordering::Relaxed);
+        let (state, paths, error) = match &*self.shared.outcome.lock().unwrap() {
+            None => ("running", Vec::new(), String::new()),
+            Some(Ok(paths)) => ("done", paths.clone(), String::new()),
+            Some(Err(_)) if cancelled => ("cancelled", Vec::new(), String::new()),
+            Some(Err(e)) => ("failed", Vec::new(), e.clone()),
+        };
+        serde_json::json!({ "state": state, "bytes": bytes, "paths": paths, "error": error }).to_string()
+    }
+
+    fn cancel(&self) {
+        self.shared.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 fn pcsuite_abi_version() -> u32 {

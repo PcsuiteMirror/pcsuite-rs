@@ -546,6 +546,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "pcsuite-core",
+ "serde_json",
  "swift-bridge",
  "swift-bridge-build",
  "tokio",

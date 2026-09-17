@@ -311,6 +311,46 @@ extension PcSessionRef {
     public func set_audio_to_pc(_ to_pc: Bool) -> Bool {
         __swift_bridge__$PcSession$set_audio_to_pc(ptr, to_pc)
     }
+
+    public func list_dir<GenericIntoRustString: IntoRustString>(_ dir: GenericIntoRustString, _ page_index: UInt32, _ page_number: UInt32) throws -> RustString {
+        try { let val = __swift_bridge__$PcSession$list_dir(ptr, { let rustString = dir.intoRustString(); rustString.isOwned = false; return rustString.ptr }(), page_index, page_number); if val.is_ok { return RustString(ptr: val.ok_or_err!) } else { throw RustString(ptr: val.ok_or_err!) } }()
+    }
+
+    public func list_category<GenericIntoRustString: IntoRustString>(_ kind: GenericIntoRustString) throws -> RustString {
+        try { let val = __swift_bridge__$PcSession$list_category(ptr, { let rustString = kind.intoRustString(); rustString.isOwned = false; return rustString.ptr }()); if val.is_ok { return RustString(ptr: val.ok_or_err!) } else { throw RustString(ptr: val.ok_or_err!) } }()
+    }
+
+    public func list_albums() throws -> RustString {
+        try { let val = __swift_bridge__$PcSession$list_albums(ptr); if val.is_ok { return RustString(ptr: val.ok_or_err!) } else { throw RustString(ptr: val.ok_or_err!) } }()
+    }
+
+    public func list_album<GenericIntoRustString: IntoRustString>(_ key_id: GenericIntoRustString, _ bucket_ids: RustVec<GenericIntoRustString>) throws -> RustString {
+        try { let val = __swift_bridge__$PcSession$list_album(ptr, { let rustString = key_id.intoRustString(); rustString.isOwned = false; return rustString.ptr }(), { let val = bucket_ids; val.isOwned = false; return val.ptr }()); if val.is_ok { return RustString(ptr: val.ok_or_err!) } else { throw RustString(ptr: val.ok_or_err!) } }()
+    }
+
+    public func create_directory<GenericIntoRustString: IntoRustString>(_ parent: GenericIntoRustString, _ name: GenericIntoRustString) throws -> RustString {
+        try { let val = __swift_bridge__$PcSession$create_directory(ptr, { let rustString = parent.intoRustString(); rustString.isOwned = false; return rustString.ptr }(), { let rustString = name.intoRustString(); rustString.isOwned = false; return rustString.ptr }()); if val.is_ok { return RustString(ptr: val.ok_or_err!) } else { throw RustString(ptr: val.ok_or_err!) } }()
+    }
+
+    public func rename_path<GenericIntoRustString: IntoRustString>(_ path: GenericIntoRustString, _ new_name: GenericIntoRustString) throws -> RustString {
+        try { let val = __swift_bridge__$PcSession$rename_path(ptr, { let rustString = path.intoRustString(); rustString.isOwned = false; return rustString.ptr }(), { let rustString = new_name.intoRustString(); rustString.isOwned = false; return rustString.ptr }()); if val.is_ok { return RustString(ptr: val.ok_or_err!) } else { throw RustString(ptr: val.ok_or_err!) } }()
+    }
+
+    public func delete_paths<GenericIntoRustString: IntoRustString>(_ paths: RustVec<GenericIntoRustString>) throws -> RustString {
+        try { let val = __swift_bridge__$PcSession$delete_paths(ptr, { let val = paths; val.isOwned = false; return val.ptr }()); if val.is_ok { return RustString(ptr: val.ok_or_err!) } else { throw RustString(ptr: val.ok_or_err!) } }()
+    }
+
+    public func directory_size<GenericIntoRustString: IntoRustString>(_ path: GenericIntoRustString) -> UInt64 {
+        __swift_bridge__$PcSession$directory_size(ptr, { let rustString = path.intoRustString(); rustString.isOwned = false; return rustString.ptr }())
+    }
+
+    public func fetch_thumbnails<GenericIntoRustString: IntoRustString>(_ paths: RustVec<GenericIntoRustString>, _ out_files: RustVec<GenericIntoRustString>) throws -> UInt32 {
+        try { let val = __swift_bridge__$PcSession$fetch_thumbnails(ptr, { let val = paths; val.isOwned = false; return val.ptr }(), { let val = out_files; val.isOwned = false; return val.ptr }()); switch val.tag { case __swift_bridge__$ResultU32AndString$ResultOk: return val.payload.ok case __swift_bridge__$ResultU32AndString$ResultErr: throw RustString(ptr: val.payload.err) default: fatalError() } }()
+    }
+
+    public func start_download<GenericIntoRustString: IntoRustString>(_ items_json: GenericIntoRustString, _ out_dir: GenericIntoRustString) -> PcDownload {
+        PcDownload(ptr: __swift_bridge__$PcSession$start_download(ptr, { let rustString = items_json.intoRustString(); rustString.isOwned = false; return rustString.ptr }(), { let rustString = out_dir.intoRustString(); rustString.isOwned = false; return rustString.ptr }()))
+    }
 }
 extension PcSession: Vectorizable {
     public static func vecOfSelfNew() -> UnsafeMutableRawPointer {
@@ -358,6 +398,90 @@ extension PcSession: Vectorizable {
 
     public static func vecOfSelfLen(vecPtr: UnsafeMutableRawPointer) -> UInt {
         __swift_bridge__$Vec_PcSession$len(vecPtr)
+    }
+}
+
+
+public class PcDownload: PcDownloadRefMut {
+    var isOwned: Bool = true
+
+    public override init(ptr: UnsafeMutableRawPointer) {
+        super.init(ptr: ptr)
+    }
+
+    deinit {
+        if isOwned {
+            __swift_bridge__$PcDownload$_free(ptr)
+        }
+    }
+}
+public class PcDownloadRefMut: PcDownloadRef {
+    public override init(ptr: UnsafeMutableRawPointer) {
+        super.init(ptr: ptr)
+    }
+}
+public class PcDownloadRef {
+    var ptr: UnsafeMutableRawPointer
+
+    public init(ptr: UnsafeMutableRawPointer) {
+        self.ptr = ptr
+    }
+}
+extension PcDownloadRef {
+    public func status() -> RustString {
+        RustString(ptr: __swift_bridge__$PcDownload$status(ptr))
+    }
+
+    public func cancel() {
+        __swift_bridge__$PcDownload$cancel(ptr)
+    }
+}
+extension PcDownload: Vectorizable {
+    public static func vecOfSelfNew() -> UnsafeMutableRawPointer {
+        __swift_bridge__$Vec_PcDownload$new()
+    }
+
+    public static func vecOfSelfFree(vecPtr: UnsafeMutableRawPointer) {
+        __swift_bridge__$Vec_PcDownload$drop(vecPtr)
+    }
+
+    public static func vecOfSelfPush(vecPtr: UnsafeMutableRawPointer, value: PcDownload) {
+        __swift_bridge__$Vec_PcDownload$push(vecPtr, {value.isOwned = false; return value.ptr;}())
+    }
+
+    public static func vecOfSelfPop(vecPtr: UnsafeMutableRawPointer) -> Optional<Self> {
+        let pointer = __swift_bridge__$Vec_PcDownload$pop(vecPtr)
+        if pointer == nil {
+            return nil
+        } else {
+            return (PcDownload(ptr: pointer!) as! Self)
+        }
+    }
+
+    public static func vecOfSelfGet(vecPtr: UnsafeMutableRawPointer, index: UInt) -> Optional<PcDownloadRef> {
+        let pointer = __swift_bridge__$Vec_PcDownload$get(vecPtr, index)
+        if pointer == nil {
+            return nil
+        } else {
+            return PcDownloadRef(ptr: pointer!)
+        }
+    }
+
+    public static func vecOfSelfGetMut(vecPtr: UnsafeMutableRawPointer, index: UInt) -> Optional<PcDownloadRefMut> {
+        let pointer = __swift_bridge__$Vec_PcDownload$get_mut(vecPtr, index)
+        if pointer == nil {
+            return nil
+        } else {
+            return PcDownloadRefMut(ptr: pointer!)
+        }
+    }
+
+    public static func vecOfSelfAsPtr(vecPtr: UnsafeMutableRawPointer) -> UnsafePointer<PcDownloadRef> {
+        UnsafePointer<PcDownloadRef>(OpaquePointer(__swift_bridge__$Vec_PcDownload$as_ptr(vecPtr)))
+    }
+
+    public static func vecOfSelfLen(vecPtr: UnsafeMutableRawPointer) -> UInt {
+        __swift_bridge__$Vec_PcDownload$len(vecPtr)
     }
 }
 

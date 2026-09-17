@@ -53,6 +53,10 @@ struct Args {
     list_type: Option<String>,
     /// `pull` phone-side absolute path.
     path: Option<String>,
+    /// `ls` phone directory to browse (instead of a category).
+    dir: Option<String>,
+    /// `probe` JSON request body (omit for a GET).
+    body: Option<String>,
     /// `push` local files (positional args).
     files: Vec<String>,
     /// `push` phone-side target directory ("" = phone default).
@@ -100,6 +104,8 @@ fn parse_args() -> Args {
         feat_notify: false,
         list_type: None,
         path: None,
+        dir: None,
+        body: None,
         files: Vec::new(),
         to: None,
         overwrite: false,
@@ -155,6 +161,14 @@ fn parse_args() -> Args {
             "--path" => {
                 i += 1;
                 a.path = raw.get(i).cloned();
+            }
+            "--body" => {
+                i += 1;
+                a.body = raw.get(i).cloned();
+            }
+            "--dir" => {
+                i += 1;
+                a.dir = raw.get(i).cloned();
             }
             "--to" => {
                 i += 1;
@@ -216,7 +230,9 @@ fn print_help() {
          pcsuite verify-code (--usb | --phone <IP> [--remote]) [--seconds <N>]\n  \
          pcsuite notify (--usb | --phone <IP> [--remote]) [--seconds <N>]\n  \
          pcsuite info (--usb | --phone <IP> [--remote])   (device model/OS + storage capacity)\n  \
-         pcsuite ls (--usb | --phone <IP> [--remote]) [--type recent|image|video|audio|file|doc|home]\n  \
+         pcsuite ls (--usb | --phone <IP> [--remote]) [--type recent|image|video|audio|file|doc|home | --dir <手机目录>]\n  \
+         pcsuite get (--usb | --phone <IP> [--remote]) <手机路径...> [--out <本地目录> 默认 .]   (文件或文件夹, 边收边写盘)\n  \
+         pcsuite thumb (--usb | --phone <IP> [--remote]) <手机路径...> [--out <本地目录> 默认 .]\n  \
          pcsuite pull (--usb | --phone <IP> [--remote]) --path <phone-path> [--out <file>]\n  \
          pcsuite push (--usb | --phone <IP> [--remote]) <local-file...> [--to <手机目录>] [--overwrite]\n  \
          pcsuite recv (--usb | --phone <IP> [--remote]) [--out <本地目录> 默认 ~/Downloads]\n  \
@@ -272,6 +288,9 @@ async fn main() -> Result<()> {
         "info" => cmd_info(args).await,
         "ls" => cmd_ls(args).await,
         "pull" => cmd_pull(args).await,
+        "get" => cmd_get(args).await,
+        "thumb" => cmd_thumb(args).await,
+        "probe" => cmd_probe(args).await,
         "push" => cmd_push(args).await,
         "recv" => cmd_recv(args).await,
         "share-recv" => cmd_share_recv(args).await,
@@ -858,12 +877,22 @@ async fn cmd_ls(args: Args) -> Result<()> {
     let phone = session.phone_info(&t.pc_ip, &t.connect_type, &identity).await?;
     tracing::info!(device = %phone.mobile_device_id, name = %phone.mobile_device_name, "phone session resolved");
 
-    let result = mdfs::list(&t.data_ip, &t.token, &phone.mobile_device_id, kind, 500).await;
+    let result = match args.dir.as_deref() {
+        Some(dir) => mdfs::list_dir(&t.data_ip, &t.token, &phone.mobile_device_id, dir, 0, 500)
+            .await
+            .map(|p| {
+                println!("📂 {dir} — {} of {} item(s)", p.entries.len(), p.total);
+                p.entries
+            }),
+        None => mdfs::list(&t.data_ip, &t.token, &phone.mobile_device_id, kind, 0, 500).await,
+    };
     drop(session);
     cleanup_transport(&t, false).await;
 
     let entries = result?;
-    println!("📂 {:?} — {} item(s) on {}", kind, entries.len(), phone.mobile_device_name);
+    if args.dir.is_none() {
+        println!("📂 {:?} — {} item(s) on {}", kind, entries.len(), phone.mobile_device_name);
+    }
     for e in &entries {
         let tag = if e.is_dir { "d" } else { "-" };
         let extra = if e.duration_ms > 0 {
@@ -904,6 +933,127 @@ async fn cmd_pull(args: Args) -> Result<()> {
     Ok(())
 }
 
+/// Download phone files/folders into a local directory over mdfs, streaming the
+/// tar to disk with a progress line.
+async fn cmd_get(args: Args) -> Result<()> {
+    let identity = config::default_identity();
+    if args.files.is_empty() {
+        anyhow::bail!("用法: pcsuite get (--usb | --phone <IP> [--remote]) <手机路径...> [--out <本地目录>]");
+    }
+    let out_dir = std::path::PathBuf::from(args.out.clone().unwrap_or_else(|| ".".into()));
+
+    let t = resolve_transport(&args, "get").await?;
+    let session = Session::connect(&t.data_ip, &t.token).await?;
+    let phone = session.phone_info(&t.pc_ip, &t.connect_type, &identity).await?;
+
+    // Folders are told apart by listing their parent (the phone reports isDirectory).
+    let mut items = Vec::new();
+    for path in &args.files {
+        let parent = std::path::Path::new(path)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "/".into());
+        let listed = mdfs::list_dir(&t.data_ip, &t.token, &phone.mobile_device_id, &parent, 0, 5000).await;
+        let found = listed.ok().and_then(|p| p.entries.into_iter().find(|e| &e.path == path));
+        items.push(mdfs::DownloadItem {
+            path: path.clone(),
+            is_dir: found.as_ref().is_some_and(|e| e.is_dir),
+            size: found.map_or(0, |e| e.size),
+        });
+    }
+    let total: u64 = items.iter().map(|i| i.size).sum();
+    let started = Instant::now();
+    let mut last = Instant::now();
+    let result = mdfs::download_to_dir(
+        &t.data_ip,
+        &t.token,
+        &phone.mobile_device_id,
+        &items,
+        &out_dir,
+        move |done| {
+            if last.elapsed() >= Duration::from_millis(500) {
+                last = Instant::now();
+                let mbps = done as f64 / 1e6 / started.elapsed().as_secs_f64().max(0.001);
+                eprint!("\r  {} / {}  {mbps:.1} MB/s   ", human_size(done), human_size(total));
+            }
+        },
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .await;
+    eprintln!();
+    drop(session);
+    cleanup_transport(&t, false).await;
+
+    for p in result? {
+        println!("✅ {}", p.display());
+    }
+    println!("   {:.1}s", started.elapsed().as_secs_f64());
+    Ok(())
+}
+
+/// Fetch thumbnails for phone paths and write them as `<n>-<name>.jpg`.
+/// Send raw requests to 10380 routes over one session and print the replies.
+/// Each positional arg is a route (`/pc_file_manager/...?a=b`); `--body` makes
+/// them POSTs with that JSON. Reverse-engineering aid.
+async fn cmd_probe(args: Args) -> Result<()> {
+    let identity = config::default_identity();
+    if args.files.is_empty() {
+        anyhow::bail!("用法: pcsuite probe (--usb | --phone <IP> [--remote]) <route...> [--body <json>]");
+    }
+    let body: Option<serde_json::Value> = args
+        .body
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .context("--body is not JSON")?;
+    let t = resolve_transport(&args, "probe").await?;
+    let session = Session::connect(&t.data_ip, &t.token).await?;
+    let phone = session.phone_info(&t.pc_ip, &t.connect_type, &identity).await?;
+    for route in &args.files {
+        let method = if body.is_some() { "POST" } else { "GET" };
+        match mdfs::raw_request(&t.data_ip, &t.token, &phone.mobile_device_id, method, route, body.as_ref()).await {
+            Ok((status, resp)) => {
+                let text = String::from_utf8_lossy(&resp);
+                let shown: String = text.chars().take(3000).collect();
+                println!("== {method} {route} → {status} ({} bytes)\n{shown}", resp.len());
+            }
+            Err(e) => println!("== {method} {route} → error: {e:#}"),
+        }
+    }
+    drop(session);
+    cleanup_transport(&t, false).await;
+    Ok(())
+}
+
+async fn cmd_thumb(args: Args) -> Result<()> {
+    let identity = config::default_identity();
+    if args.files.is_empty() {
+        anyhow::bail!("用法: pcsuite thumb (--usb | --phone <IP> [--remote]) <手机路径...> [--out <本地目录>]");
+    }
+    let out_dir = std::path::PathBuf::from(args.out.clone().unwrap_or_else(|| ".".into()));
+    std::fs::create_dir_all(&out_dir)?;
+
+    let t = resolve_transport(&args, "thumb").await?;
+    let session = Session::connect(&t.data_ip, &t.token).await?;
+    let phone = session.phone_info(&t.pc_ip, &t.connect_type, &identity).await?;
+    let result = mdfs::thumbnails(&t.data_ip, &t.token, &phone.mobile_device_id, &args.files).await;
+    drop(session);
+    cleanup_transport(&t, false).await;
+
+    let thumbs = result?;
+    println!("🖼  {} of {} thumbnail(s)", thumbs.len(), args.files.len());
+    for (i, (path, bytes)) in thumbs.iter().enumerate() {
+        let name = std::path::Path::new(path)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let out = out_dir.join(format!("{i}-{name}.jpg"));
+        std::fs::write(&out, bytes)?;
+        println!("  {:>9}  {} → {}", human_size(bytes.len() as u64), path, out.display());
+    }
+    Ok(())
+}
+
 /// Upload local files to the phone (desktop 拖拽上传路径): `drop_files_info` 登记 +
 /// `/upload/drop_file_to_phone` 流式 tar(chunked)。v1 只收普通文件。
 async fn cmd_push(args: Args) -> Result<()> {
@@ -912,32 +1062,10 @@ async fn cmd_push(args: Args) -> Result<()> {
         anyhow::bail!("用法: pcsuite push (--usb | --phone <IP> [--remote]) <本地文件...> [--to <手机目录>] [--overwrite]");
     }
 
-    let mut items = Vec::with_capacity(args.files.len());
-    for f in &args.files {
-        let p = std::path::Path::new(f);
-        let md = std::fs::metadata(p).with_context(|| format!("stat {f}"))?;
-        if md.is_dir() {
-            anyhow::bail!("{f}: 目录上传暂不支持（后续版本），请只传普通文件");
-        }
-        if !md.is_file() {
-            anyhow::bail!("{f}: 不是普通文件");
-        }
-        let name = p
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .with_context(|| format!("{f}: 无法取文件名"))?;
-        let mtime_ms = md
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        items.push(mdfs::UploadItem {
-            local: p.to_path_buf(),
-            name,
-            size: md.len(),
-            mtime_ms,
-        });
+    let paths: Vec<std::path::PathBuf> = args.files.iter().map(std::path::PathBuf::from).collect();
+    let items = mdfs::upload_items(&paths)?;
+    if items.is_empty() {
+        anyhow::bail!("没有可上传的文件（文件夹是空的？）");
     }
 
     let t = resolve_transport(&args, "push").await?;
@@ -962,7 +1090,7 @@ async fn cmd_push(args: Args) -> Result<()> {
     let dest = args.to.as_deref().unwrap_or("手机默认目录(Download/vivo办公套件)");
     println!(
         "✅ pushed {} file(s) ({}) → {dest}",
-        items.len(),
+        items.iter().filter(|it| !it.is_dir).count(),
         human_size(total)
     );
     Ok(())
