@@ -406,7 +406,10 @@ async fn handle_8904(stream: TcpStream, shared: SharedRef, backend: Arc<dyn Clip
                 }
                 Parsed::NeedMore(_) => break,
                 Parsed::Invalid => {
-                    tracing::warn!("invalid 8904 frame; clearing buffer");
+                    // Dump the head so we can reverse what the phone sent (seen in a
+                    // burst right before PC→phone clipboard came back to life).
+                    let head = &buf[..buf.len().min(64)];
+                    tracing::warn!(len = buf.len(), head = %hex::encode(head), "invalid 8904 frame; clearing buffer");
                     buf.clear();
                     break;
                 }
