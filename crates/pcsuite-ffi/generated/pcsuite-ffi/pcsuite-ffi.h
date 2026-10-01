@@ -103,6 +103,7 @@ bool __swift_bridge__$PcSession$text(void* self, void* s);
 bool __swift_bridge__$PcSession$delete_surrounding(void* self, int64_t before, int64_t after);
 bool __swift_bridge__$PcSession$tap(void* self, int64_t x, int64_t y, int64_t w, int64_t h);
 bool __swift_bridge__$PcSession$key(void* self, int64_t keycode);
+bool __swift_bridge__$PcSession$key_meta(void* self, int64_t keycode, int64_t metastate);
 bool __swift_bridge__$PcSession$set_audio_to_pc(void* self, bool to_pc);
 struct __private__ResultPtrAndPtr __swift_bridge__$PcSession$list_dir(void* self, void* dir, uint32_t page_index, uint32_t page_number);
 struct __private__ResultPtrAndPtr __swift_bridge__$PcSession$list_category(void* self, void* kind);

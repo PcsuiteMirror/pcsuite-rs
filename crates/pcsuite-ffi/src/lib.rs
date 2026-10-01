@@ -191,6 +191,9 @@ mod ffi {
         // Press an Android key (down+up). keycode is a KEYCODE_* value, e.g.
         // BACK=4, HOME=3, APP_SWITCH=187. Drives the on-screen navigation keys.
         fn key(&self, keycode: i64) -> bool;
+        // Press an Android key with modifiers held: metastate is a KeyEvent
+        // META_* mask, e.g. META_CTRL_ON=0x1000 with KEYCODE_C=31 for Ctrl+C.
+        fn key_meta(&self, keycode: i64, metastate: i64) -> bool;
         // Move the phone's audio between the phone's own speaker and this PC while
         // mirroring — no stream restart. to_pc=true: the phone mutes itself and
         // starts sending AAC (poll next_audio_frame); false: it stops sending and
@@ -1137,6 +1140,13 @@ impl PcSession {
             return false;
         };
         rt().block_on(input.key(keycode)).is_ok()
+    }
+
+    fn key_meta(&self, keycode: i64, metastate: i64) -> bool {
+        let Some(input) = self.input.lock().unwrap().clone() else {
+            return false;
+        };
+        rt().block_on(input.key_meta(keycode, metastate)).is_ok()
     }
 
     fn set_audio_to_pc(&self, to_pc: bool) -> bool {

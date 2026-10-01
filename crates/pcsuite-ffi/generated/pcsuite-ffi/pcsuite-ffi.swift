@@ -308,6 +308,10 @@ extension PcSessionRef {
         __swift_bridge__$PcSession$key(ptr, keycode)
     }
 
+    public func key_meta(_ keycode: Int64, _ metastate: Int64) -> Bool {
+        __swift_bridge__$PcSession$key_meta(ptr, keycode, metastate)
+    }
+
     public func set_audio_to_pc(_ to_pc: Bool) -> Bool {
         __swift_bridge__$PcSession$set_audio_to_pc(ptr, to_pc)
     }

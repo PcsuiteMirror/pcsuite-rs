@@ -97,6 +97,16 @@ impl InputHandle {
         self.key_action(KeyAction::Up, keycode).await
     }
 
+    /// A key press with modifiers held: down then up for `keycode`, both carrying
+    /// the Android `metastate` (e.g. `META_CTRL_ON` = 0x1000 for Ctrl+A/X/C/V,
+    /// which the phone's text views treat as select all / cut / copy / paste).
+    /// The phone builds its `KeyEvent` from this field directly, so no separate
+    /// Ctrl down/up is needed.
+    pub async fn key_meta(&self, keycode: i64, metastate: i64) -> Result<()> {
+        self.send(input::keycode_event(KeyAction::Down, keycode, metastate, 0)).await?;
+        self.send(input::keycode_event(KeyAction::Up, keycode, metastate, 0)).await
+    }
+
     /// Send a pre-built `/mirror/control` text message (escape hatch).
     pub async fn raw(&self, msg: String) -> Result<()> {
         self.send(msg).await

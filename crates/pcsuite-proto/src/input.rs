@@ -261,4 +261,13 @@ mod tests {
         assert_eq!(v["scancode"], 0);
         assert_eq!(keycode_event(KeyAction::Up, 187, 0, 0).matches("\"action\":1").count(), 1);
     }
+
+    #[test]
+    fn keycode_event_carries_ctrl() {
+        // Ctrl+C: KEYCODE_C with META_CTRL_ON — the phone builds its KeyEvent from it.
+        let k = keycode_event(KeyAction::Down, 31, 0x1000, 0);
+        let v: serde_json::Value = serde_json::from_str(&k["KEYCODE_EVENT:".len()..]).unwrap();
+        assert_eq!(v["keycode"], 31);
+        assert_eq!(v["metastate"], 4096);
+    }
 }
