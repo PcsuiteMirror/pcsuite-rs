@@ -26,7 +26,8 @@ use std::sync::OnceLock;
 use tokio::runtime::Runtime;
 
 use pcsuite_core::{
-    cloud, config, pair, presence_once, register, usb, ClipboardConfig, ConnectAnswer, DeadReason,
+    cloud, config, pair, presence_once, register, usb, ClipLink, ClipboardConfig, ConnectAnswer,
+    DeadReason,
     InputHandle,
     MouseAction, MouseButton, PhoneNotify, PresenceConfig, RegisterConfig, Registration,
     ScreenParams, ScreenStream, Session, UsbConfig,
@@ -171,8 +172,17 @@ mod ffi {
         // mid-mirror drops alike.
         fn wait_disconnect(&self) -> String;
         // Ask wait_disconnect() to return "" within ~300ms so its watcher thread can
-        // break and release this PcSession before the handle is dropped.
+        // break and release this PcSession before the handle is dropped. Stops
+        // wait_clipboard_link() the same way.
         fn stop_watch(&self);
+        // Block until the clipboard's 8904 link state differs from `last`, then
+        // return it: "off" (clipboard sync not enabled), "pending" (handshake
+        // running), "up" (the phone is connected to our 8904 relay — both
+        // directions work), "down" (the phone didn't connect within 5s of the
+        // handshake, or its connection ended — nothing syncs, though the session
+        // is otherwise fine). Pass "" to get the current state at once. Returns ""
+        // after stop_watch(). Run on a background thread.
+        fn wait_clipboard_link(&self, last: String) -> String;
 
         // Inject a mouse event. action: 0=down,1=up,2=move. button: 1=left,2=right.
         // Coordinates are in your reference frame (w, h); the phone scales.
@@ -543,6 +553,8 @@ pub struct PcSession {
     dead_rx: tokio::sync::Mutex<tokio::sync::watch::Receiver<Option<DeadReason>>>,
     // Set by stop_watch(); the disconnect watcher checks it between short timeouts.
     watch_stop: std::sync::atomic::AtomicBool,
+    // Clipboard 8904 link state; polled by wait_clipboard_link (same stop flag).
+    clip_link_rx: tokio::sync::Mutex<tokio::sync::watch::Receiver<ClipLink>>,
     token: String,
     data_ip: String,
     pc_ip: String,
@@ -1089,6 +1101,29 @@ impl PcSession {
 
     fn stop_watch(&self) {
         self.watch_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn wait_clipboard_link(&self, last: String) -> String {
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+        rt().block_on(async {
+            let mut rx = self.clip_link_rx.lock().await;
+            loop {
+                if self.watch_stop.load(Ordering::Relaxed) {
+                    return String::new();
+                }
+                let now = rx.borrow_and_update().as_str();
+                if now != last {
+                    return now.to_string();
+                }
+                // Short timeout so stop_watch() is noticed promptly (mirror of
+                // wait_disconnect). A dropped sender means the session went away;
+                // stop_watch() is about to say so.
+                if let Ok(Err(_)) = tokio::time::timeout(Duration::from_millis(300), rx.changed()).await {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
+            }
+        })
     }
 
     fn mouse(&self, action: u8, button: u8, x: i64, y: i64, w: i64, h: i64) -> bool {
@@ -2065,6 +2100,7 @@ fn pcsuite_connect_usb() -> Result<PcSession, String> {
         Ok::<_, anyhow::Error>((u, session))
     })?;
     let dead_rx = session.dead_signal();
+    let clip_link_rx = session.clip_link();
     Ok(PcSession {
         session: tokio::sync::Mutex::new(session),
         input: std::sync::Mutex::new(None),
@@ -2081,6 +2117,7 @@ fn pcsuite_connect_usb() -> Result<PcSession, String> {
         center_stop: std::sync::atomic::AtomicBool::new(false),
         dead_rx: tokio::sync::Mutex::new(dead_rx),
         watch_stop: std::sync::atomic::AtomicBool::new(false),
+        clip_link_rx: tokio::sync::Mutex::new(clip_link_rx),
         token: u.token,
         data_ip: "127.0.0.1".into(),
         pc_ip: "127.0.0.1".into(),
@@ -2178,6 +2215,7 @@ fn build_wlan_session(
     let id = config::default_identity();
     let pc_ip = local_ip_toward(&phone_ip).unwrap_or_else(|| "0.0.0.0".into());
     let dead_rx = session.dead_signal();
+    let clip_link_rx = session.clip_link();
     PcSession {
         session: tokio::sync::Mutex::new(session),
         input: std::sync::Mutex::new(None),
@@ -2194,6 +2232,7 @@ fn build_wlan_session(
         center_stop: std::sync::atomic::AtomicBool::new(false),
         dead_rx: tokio::sync::Mutex::new(dead_rx),
         watch_stop: std::sync::atomic::AtomicBool::new(false),
+        clip_link_rx: tokio::sync::Mutex::new(clip_link_rx),
         token,
         data_ip: phone_ip.clone(),
         pc_ip,

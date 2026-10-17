@@ -373,6 +373,27 @@ async fn upgrade_in_place(
     Ok(token)
 }
 
+/// Log what the phone sends on the held 10191 connection while a session rides on
+/// it. None of it is answered — nothing seen so far needed an answer — but the
+/// phone has been seen to end idle Wi-Fi sessions on its own, with nothing on the
+/// 10380 side to say why. If it is waiting on this connection for something we
+/// never send, this is where that shows.
+fn log_session_push(data: &[u8]) {
+    match payload1::parse_reply_lenient(data) {
+        Some((v, _)) => tracing::info!(
+            code = ?connect::reply_code(&v),
+            bytes = data.len(),
+            json = %v,
+            "presence: phone push during session"
+        ),
+        None => tracing::info!(
+            bytes = data.len(),
+            hex = %hex::encode(&data[..data.len().min(400)]),
+            "presence: phone data during session (unparsed)"
+        ),
+    }
+}
+
 /// A connection id shaped like the official desktop's — `<4 hex>_<epoch ms>`
 /// (Electron `pre-connect-mode`: `${createRandomStr(4)}_${Date.now()}`).
 fn official_conn_id() -> String {
@@ -496,9 +517,13 @@ where
                                     return Ok(());
                                 }
                                 n = sock.read(&mut tmp) => match n {
-                                    Ok(0) => return Ok(()),
-                                    Ok(_) => continue,
+                                    Ok(0) => {
+                                        tracing::info!("presence: phone closed 10191 during the session (EOF)");
+                                        return Ok(());
+                                    }
+                                    Ok(n) => log_session_push(&tmp[..n]),
                                     Err(e) => {
+                                        tracing::info!(err = %e, kind = ?e.kind(), "presence: 10191 read failed during the session");
                                         return Err(e).context("presence read (local session)")
                                     }
                                 },
@@ -601,19 +626,13 @@ where
                                         return Ok(());
                                     }
                                     read = sock.read(&mut tmp) => match read {
-                                        Ok(0) => return Ok(()),
-                                        Ok(n) => {
-                                            if let Some((v, _)) =
-                                                payload1::parse_reply_lenient(&tmp[..n])
-                                            {
-                                                tracing::info!(
-                                                    code = ?connect::reply_code(&v),
-                                                    json = %v,
-                                                    "presence: phone push (connected)"
-                                                );
-                                            }
+                                        Ok(0) => {
+                                            tracing::info!("presence: phone closed 10191 during the session (EOF)");
+                                            return Ok(());
                                         }
+                                        Ok(n) => log_session_push(&tmp[..n]),
                                         Err(e) => {
+                                            tracing::info!(err = %e, kind = ?e.kind(), "presence: 10191 read failed during the session");
                                             return Err(e).context("presence read (connected)")
                                         }
                                     },

@@ -29,7 +29,7 @@ pub mod vdfs;
 pub mod verify;
 pub mod wsconn;
 
-pub use clipboard::{run_clipboard, ClipboardBackend, ClipboardConfig};
+pub use clipboard::{run_clipboard, ClipLink, ClipboardBackend, ClipboardConfig};
 pub use cloud::{Account, CloudDevice, ConnectCenter, PhoneTarget};
 pub use connect::{
     presence_once, register, ConnectAnswer, PresenceConfig, RegisterConfig, Registration,

@@ -97,6 +97,7 @@ void __swift_bridge__$PcSession$stop_file_transfer(void* self);
 struct __private__ResultPtrAndPtr __swift_bridge__$PcSession$device_info(void* self);
 void* __swift_bridge__$PcSession$wait_disconnect(void* self);
 void __swift_bridge__$PcSession$stop_watch(void* self);
+void* __swift_bridge__$PcSession$wait_clipboard_link(void* self, void* last);
 bool __swift_bridge__$PcSession$mouse(void* self, uint8_t action, uint8_t button, int64_t x, int64_t y, int64_t w, int64_t h);
 bool __swift_bridge__$PcSession$scroll(void* self, int64_t vscroll, int64_t x, int64_t y, int64_t w, int64_t h);
 bool __swift_bridge__$PcSession$text(void* self, void* s);

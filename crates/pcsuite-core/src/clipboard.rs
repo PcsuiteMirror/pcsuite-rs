@@ -17,7 +17,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, watch, Mutex};
 use tokio::time::timeout;
 
 use tokio::task::JoinHandle;
@@ -84,6 +84,35 @@ pub struct ClipboardConfig {
     pub send_to_phone: bool,
 }
 
+/// Whether the phone is connected to our 8904 relay — the one link every
+/// clipboard frame rides, in both directions. The control-WS handshake can
+/// succeed while this never comes up (seen after the phone dropped a Wi-Fi
+/// session abruptly: the reconnected session got the phone's key, but the phone
+/// never connected back), and then nothing syncs while the session otherwise
+/// looks healthy — so it is tracked and surfaced on its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClipLink {
+    /// Clipboard sync isn't enabled on this session.
+    Off,
+    /// The handshake is running; the phone hasn't connected to 8904 yet.
+    Pending,
+    /// The phone is connected to 8904.
+    Up,
+    /// The phone didn't connect in time, or its connection ended.
+    Down,
+}
+
+impl ClipLink {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ClipLink::Off => "off",
+            ClipLink::Pending => "pending",
+            ClipLink::Up => "up",
+            ClipLink::Down => "down",
+        }
+    }
+}
+
 pub(crate) struct Shared {
     pc_key: String,
     pc_iv: String,
@@ -105,6 +134,8 @@ pub(crate) struct Shared {
     /// When false, incoming phone clipboard frames are read but NOT written to the
     /// OS clipboard (used to make the relay PC→phone only).
     apply_incoming: bool,
+    /// 8904 link state, published to the session's watchers.
+    link: watch::Sender<ClipLink>,
 }
 
 impl Shared {
@@ -184,6 +215,7 @@ pub async fn run_clipboard(cfg: ClipboardConfig, backend: Arc<dyn ClipboardBacke
         cfg.vdfs_fetch_host.clone(),
         cfg.vdfs_fetch_port,
         cfg.recv_from_phone,
+        watch::channel(ClipLink::Pending).0,
     );
 
     // 8904 relay server (phone reverse-connects here)
@@ -775,6 +807,7 @@ pub(crate) fn new_shared(
     fetch_host: String,
     fetch_port: u16,
     apply_incoming: bool,
+    link: watch::Sender<ClipLink>,
 ) -> SharedRef {
     Arc::new(Mutex::new(Shared {
         pc_key,
@@ -790,6 +823,7 @@ pub(crate) fn new_shared(
         last_image_ref: None,
         last_image_sig: None,
         apply_incoming,
+        link,
     }))
 }
 
@@ -831,13 +865,19 @@ pub(crate) fn spawn_8904_server(
     backend: Arc<dyn ClipboardBackend>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let link = shared.lock().await.link.clone();
         loop {
             match listener.accept().await {
                 Ok((stream, addr)) => {
                     tracing::info!(%addr, "phone connected to 8904");
+                    link.send_replace(ClipLink::Up);
                     if let Err(e) = handle_8904(stream, shared.clone(), backend.clone()).await {
                         tracing::warn!(err = %e, "8904 connection ended");
                     }
+                    // Info, not warn: a graceful disconnect ends it too, just
+                    // before this task is aborted.
+                    tracing::info!("phone's 8904 connection closed; clipboard sync is down until it reconnects");
+                    link.send_replace(ClipLink::Down);
                 }
                 Err(e) => {
                     tracing::warn!(err = %e, "8904 accept failed");
@@ -865,6 +905,10 @@ pub(crate) fn spawn_watcher(
 pub const SHADOW_REPLY_WAIT: Duration = Duration::from_secs(3);
 pub const SHADOW_STARTUP_RESENDS: u32 = 2;
 
+/// How long after `ready` the phone gets to connect to our 8904 relay. It
+/// normally does within ~0.2s, over Wi-Fi and USB alike.
+pub const RELAY_CONNECT_WAIT: Duration = Duration::from_secs(5);
+
 /// Drive the SHADOW_LIKE handshake over a shared control channel: send `startup`,
 /// wait for the phone's key/iv, store them, send `ready`.
 ///
@@ -887,19 +931,20 @@ pub(crate) async fn clip_handshake(control: ControlHandle, shared: SharedRef, st
     // check the retained last-SHADOW_LIKE.
     if let Some(t) = control.last_shadow() {
         if apply_shadow(&control, &shared, &t).await {
+            await_relay(&shared).await;
             return;
         }
     }
     let mut resent = 0u32;
     // A fixed deadline, not a per-message timeout: the phone echoes other
     // control text (our own startup among it) and that must not keep pushing
-    // the re-send out.
-    let mut deadline = tokio::time::Instant::now() + SHADOW_REPLY_WAIT;
+    // the re-send out. `None` once the last re-send's window has passed too.
+    let mut deadline = Some(tokio::time::Instant::now() + SHADOW_REPLY_WAIT);
     loop {
-        let next = if resent < SHADOW_STARTUP_RESENDS {
-            match tokio::time::timeout_at(deadline, rx.recv()).await {
+        let next = match deadline {
+            Some(d) => match tokio::time::timeout_at(d, rx.recv()).await {
                 Ok(r) => r,
-                Err(_) => {
+                Err(_) if resent < SHADOW_STARTUP_RESENDS => {
                     resent += 1;
                     tracing::warn!(
                         attempt = resent + 1,
@@ -907,7 +952,7 @@ pub(crate) async fn clip_handshake(control: ControlHandle, shared: SharedRef, st
                         SHADOW_REPLY_WAIT.as_secs()
                     );
                     let _ = control.send(startup_msg.clone()).await;
-                    deadline = tokio::time::Instant::now() + SHADOW_REPLY_WAIT;
+                    deadline = Some(tokio::time::Instant::now() + SHADOW_REPLY_WAIT);
                     if resent == SHADOW_STARTUP_RESENDS {
                         tracing::warn!(
                             "clipboard: last re-send; if the phone stays silent the clipboard is off for this session (reconnect to retry)"
@@ -915,13 +960,19 @@ pub(crate) async fn clip_handshake(control: ControlHandle, shared: SharedRef, st
                     }
                     continue;
                 }
-            }
-        } else {
-            rx.recv().await
+                Err(_) => {
+                    tracing::warn!("clipboard: the phone never answered the handshake — clipboard sync is down");
+                    shared.lock().await.link.send_replace(ClipLink::Down);
+                    deadline = None;
+                    continue;
+                }
+            },
+            None => rx.recv().await,
         };
         match next {
             Ok(t) => {
                 if apply_shadow(&control, &shared, &t).await {
+                    await_relay(&shared).await;
                     return;
                 }
             }
@@ -945,4 +996,29 @@ async fn apply_shadow(control: &ControlHandle, shared: &SharedRef, t: &str) -> b
     let _ = control.send(clip::shadow_ready()).await;
     tracing::info!("clipboard: phone key received; sent SHADOW_LIKE ready");
     true
+}
+
+/// After `ready`: give the phone [`RELAY_CONNECT_WAIT`] to connect to 8904, and
+/// mark the link down if it doesn't. The handshake alone proves nothing — the
+/// phone can answer it and still never connect back, and then the watcher has
+/// nowhere to send and nothing arrives, without a single error anywhere.
+async fn await_relay(shared: &SharedRef) {
+    let link = shared.lock().await.link.clone();
+    let mut rx = link.subscribe();
+    let up = tokio::time::timeout(RELAY_CONNECT_WAIT, rx.wait_for(|l| *l == ClipLink::Up)).await;
+    if matches!(up, Ok(Ok(_))) {
+        return;
+    }
+    tracing::warn!(
+        "clipboard: phone answered the handshake but didn't connect to 8904 within {}s — clipboard sync is down (disconnect and reconnect to restore)",
+        RELAY_CONNECT_WAIT.as_secs()
+    );
+    // Unless it connected in the meantime.
+    link.send_if_modified(|l| {
+        if *l == ClipLink::Up {
+            return false;
+        }
+        *l = ClipLink::Down;
+        true
+    });
 }

@@ -284,6 +284,10 @@ extension PcSessionRef {
         __swift_bridge__$PcSession$stop_watch(ptr)
     }
 
+    public func wait_clipboard_link<GenericIntoRustString: IntoRustString>(_ last: GenericIntoRustString) -> RustString {
+        RustString(ptr: __swift_bridge__$PcSession$wait_clipboard_link(ptr, { let rustString = last.intoRustString(); rustString.isOwned = false; return rustString.ptr }()))
+    }
+
     public func mouse(_ action: UInt8, _ button: UInt8, _ x: Int64, _ y: Int64, _ w: Int64, _ h: Int64) -> Bool {
         __swift_bridge__$PcSession$mouse(ptr, action, button, x, y, w, h)
     }

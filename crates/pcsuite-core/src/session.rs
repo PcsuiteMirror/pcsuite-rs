@@ -20,7 +20,7 @@ use pcsuite_proto::PcIdentity;
 use pcsuite_proto::screen as screenmsg;
 use pcsuite_proto::screen::ScreenParams;
 
-use crate::clipboard::{self, ClipboardBackend, ClipboardConfig};
+use crate::clipboard::{self, ClipLink, ClipboardBackend, ClipboardConfig};
 use crate::config;
 use crate::filetrans::FileTransConfig;
 use crate::screen::InputHandle;
@@ -68,6 +68,10 @@ pub struct Session {
     /// subscribers; an aborted task (intentional teardown) drops the sender instead,
     /// which the FFI distinguishes via its own stop flag.
     dead_rx: watch::Receiver<Option<DeadReason>>,
+    /// Clipboard 8904 link state (see [`ClipLink`]); `Off` until
+    /// [`Session::enable_clipboard`]. Outlives any one clipboard arming, so a
+    /// watcher subscribed at connect sees every change.
+    clip_link: watch::Sender<ClipLink>,
 }
 
 /// How a session ended. The app treats the two very differently: a link that
@@ -164,6 +168,7 @@ impl Session {
             token: token.to_string(),
             tasks: vec![task],
             dead_rx,
+            clip_link: watch::channel(ClipLink::Off).0,
         })
     }
 
@@ -221,6 +226,11 @@ impl Session {
     /// drive reconnection. Cloned so each consumer awaits independently.
     pub fn dead_signal(&self) -> watch::Receiver<Option<DeadReason>> {
         self.dead_rx.clone()
+    }
+
+    /// A receiver for the clipboard's 8904 link state.
+    pub fn clip_link(&self) -> watch::Receiver<ClipLink> {
+        self.clip_link.subscribe()
     }
 
     /// Discover the connected phone's `mobileDeviceId` (and its vdfs session key/iv)
@@ -325,11 +335,13 @@ impl Session {
             cfg.vdfs_fetch_host.clone(),
             cfg.vdfs_fetch_port,
             cfg.recv_from_phone,
+            self.clip_link.clone(),
         );
         let listener = TcpListener::bind(format!("{}:8904", cfg.bind_addr))
             .await
             .with_context(|| format!("bind {}:8904", cfg.bind_addr))?;
         tracing::info!(bind = %cfg.bind_addr, "8904 relay listening");
+        self.clip_link.send_replace(ClipLink::Pending);
         self.tasks
             .push(clipboard::spawn_8904_server(listener, shared.clone(), backend.clone()));
 
@@ -520,8 +532,17 @@ async fn control_task(
     // so the exit that follows is attributed to the phone, not the network.
     let mut peer_said_close = false;
     let mut last_text = String::new();
+    // For the exit log: which path declared the link gone, with the I/O error,
+    // and how long the phone had been silent by then. The phone has been seen to
+    // end idle Wi-Fi sessions with nothing else to go on.
+    let why: String;
+    let mut last_rx = Instant::now();
     let reason = 'run: loop {
-        match timeout(Duration::from_millis(200), ws.recv()).await {
+        let got = timeout(Duration::from_millis(200), ws.recv()).await;
+        if matches!(got, Ok(Ok(_))) {
+            last_rx = Instant::now();
+        }
+        match got {
             Ok(Ok(WsFrame::Text(t))) => {
                 if t.trim().eq_ignore_ascii_case("close") {
                     peer_said_close = true;
@@ -545,19 +566,37 @@ async fn control_task(
                 let _ = in_tx.send(t);
             }
             Ok(Ok(WsFrame::Ping(p))) => {
-                if ws.send_pong(&p).await.is_err() {
+                if let Err(e) = ws.send_pong(&p).await {
+                    why = format!("pong send failed: {e} ({:?})", e.kind());
                     break 'run DeadReason::Lost;
                 }
             }
-            Ok(Ok(WsFrame::Close)) => break 'run DeadReason::Closed,
+            Ok(Ok(WsFrame::Close)) => {
+                why = "close frame from the phone".into();
+                break 'run DeadReason::Closed;
+            }
+            // The phone only sends text and pings here. Anything else would mean
+            // the reader lost its place in the stream: `recv` is not
+            // cancellation-safe, and the timeout above cancels it.
+            Ok(Ok(WsFrame::Binary(b))) => {
+                tracing::warn!(
+                    len = b.len(),
+                    head = %hex::encode(&b[..b.len().min(32)]),
+                    "[control] unexpected binary frame"
+                );
+            }
             Ok(Ok(_)) => {}
-            Ok(Err(_)) => break 'run DeadReason::Lost,
+            Ok(Err(e)) => {
+                why = format!("read failed: {e} ({:?})", e.kind());
+                break 'run DeadReason::Lost;
+            }
             Err(_) => {} // recv timeout -> flush outgoing + keepalive
         }
         loop {
             match out_rx.try_recv() {
                 Ok(msg) => {
-                    if ws.send_text(&msg).await.is_err() {
+                    if let Err(e) = ws.send_text(&msg).await {
+                        why = format!("send failed: {e} ({:?})", e.kind());
                         break 'run DeadReason::Lost;
                     }
                 }
@@ -565,7 +604,8 @@ async fn control_task(
             }
         }
         if last_ka.elapsed() >= Duration::from_secs(3) {
-            if ws.send_text(screenmsg::KEEPALIVE).await.is_err() {
+            if let Err(e) = ws.send_text(screenmsg::KEEPALIVE).await {
+                why = format!("keepalive send failed: {e} ({:?})", e.kind());
                 break 'run DeadReason::Lost;
             }
             last_ka = Instant::now();
@@ -575,6 +615,12 @@ async fn control_task(
     // Control WS is gone — report the disconnect to whoever is watching. The
     // last frame is logged so a phone-side disconnect we don't recognise yet can
     // be identified from the log rather than a capture.
-    tracing::info!(?reason, last_frame = %last_text, "[control] WS ended");
+    tracing::info!(
+        ?reason,
+        why = %why,
+        phone_silent_ms = last_rx.elapsed().as_millis() as u64,
+        last_frame = %last_text,
+        "[control] WS ended"
+    );
     let _ = dead_tx.send(Some(reason));
 }
